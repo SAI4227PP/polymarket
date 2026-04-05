@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use adapters_binance::{ws as binance_ws, BinanceClient};
 use adapters_polymarket::{ws as polymarket_ws, PolymarketClient};
-use common::{Quote, TradeDirection};
+use common::{Quote, RiskDecision, TradeDirection};
 use execution_engine::order_manager::{self, ExecutionConfig};
 use portfolio_engine::pnl::total_pnl;
 use portfolio_engine::positions::{mark_to_market, update_position, Position};
@@ -36,6 +36,8 @@ struct CompletedTrade {
     quantity: f64,
     entry_price: f64,
     exit_price: f64,
+    entry_probability: f64,
+    exit_probability: f64,
     entry_notional_usd: f64,
     exit_notional_usd: f64,
     pnl_usd: f64,
@@ -57,6 +59,10 @@ struct TraderState {
     direction: String,
     risk_allowed: bool,
     action: String,
+    position_signal: String,
+    entry_signal: bool,
+    exit_signal: bool,
+    close_reason: String,
     execution_status: String,
     open_positions: usize,
     day_pnl_usd: f64,
@@ -159,10 +165,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        let closed = settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
-        if !closed.is_empty() {
-            trade_history.extend(closed);
-            trim_history(&mut trade_history, trade_history_limit);
+        let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
+        if enforce_position_ttl {
+            let closed = settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
+            if !closed.is_empty() {
+                trade_history.extend(closed);
+                trim_history(&mut trade_history, trade_history_limit);
+            }
         }
         let open_positions = pending_positions.len();
         let open_direction = current_open_direction(&pending_positions);
@@ -381,21 +390,6 @@ async fn run_iteration(
     let pm_fresh = pm_quote_age_ms <= max_quote_age_ms;
     let bn_fresh = bn_quote_age_ms <= max_quote_age_ms;
 
-    let projected_gross_exposure_usd = current_gross_exposure_usd + order_notional_usd;
-    let projected_largest_position_usd = current_largest_position_usd.max(order_notional_usd);
-    let risk = evaluate_trade(
-        RiskInput {
-            notional_usd: order_notional_usd,
-            day_pnl_usd,
-            open_positions,
-            gross_exposure_usd: projected_gross_exposure_usd,
-            account_equity_usd,
-            realized_vol_bps,
-            largest_position_usd: projected_largest_position_usd,
-        },
-        risk_limits,
-    );
-
     let has_open_positions = open_positions > 0;
     let reversal_signal = has_open_positions
         && open_direction
@@ -403,17 +397,60 @@ async fn run_iteration(
             .unwrap_or(false);
 
     let top_book_liquidity_usd = env_f64("TOP_BOOK_LIQUIDITY_USD", 5_000.0);
+    let no_entry_last_seconds_5m = env_u64("NO_ENTRY_LAST_SECONDS_5M", 15).min(299);
+    let blocked_last_seconds_5m = is_last_seconds_of_five_min_window(now, no_entry_last_seconds_5m);
+    let risk_capped_notional_usd = capped_entry_notional_usd(
+        order_notional_usd,
+        current_gross_exposure_usd,
+        risk_limits,
+        account_equity_usd,
+    );
+
     let can_open_new_position = !has_open_positions;
-    let intent = if can_open_new_position && risk.allowed && pm_fresh && bn_fresh {
+    let candidate_intent = if can_open_new_position && pm_fresh && bn_fresh && !blocked_last_seconds_5m {
         order_manager::build_order_intent(
             "BTC",
             &signal,
             pm_quote.price,
-            order_notional_usd,
+            risk_capped_notional_usd,
             top_book_liquidity_usd,
             realized_vol_bps,
             execution_cfg,
         )
+    } else {
+        None
+    };
+
+    let candidate_notional_usd = candidate_intent
+        .as_ref()
+        .map(|o| o.quantity * o.limit_price)
+        .unwrap_or(risk_capped_notional_usd);
+
+    let risk = if can_open_new_position {
+        let projected_gross_exposure_usd = current_gross_exposure_usd + candidate_notional_usd;
+        let projected_largest_position_usd = current_largest_position_usd.max(candidate_notional_usd);
+        evaluate_trade(
+            RiskInput {
+                notional_usd: candidate_notional_usd,
+                day_pnl_usd,
+                open_positions,
+                gross_exposure_usd: projected_gross_exposure_usd,
+                account_equity_usd,
+                realized_vol_bps,
+                largest_position_usd: projected_largest_position_usd,
+            },
+            risk_limits,
+        )
+    } else {
+        RiskDecision {
+            allowed: true,
+            reason: "existing position managed by signal/quote freshness".to_string(),
+            violations: Vec::new(),
+        }
+    };
+
+    let intent = if can_open_new_position && risk.allowed {
+        candidate_intent
     } else {
         None
     };
@@ -422,14 +459,80 @@ async fn run_iteration(
         .as_ref()
         .map(|o| o.quantity * o.limit_price)
         .unwrap_or(0.0);
-    let report = order_manager::submit_if_needed(intent);
+    let mut report = order_manager::submit_if_needed(intent);
+    if !report.accepted && can_open_new_position && blocked_last_seconds_5m {
+        report.status = format!(
+            "skipped:last_seconds_5m_guard remaining_s<={}",
+            no_entry_last_seconds_5m
+        );
+    } else if !report.accepted
+        && can_open_new_position
+        && risk_capped_notional_usd < execution_cfg.min_order_notional_usd
+    {
+        report.status = format!(
+            "skipped:risk_budget_too_small capped_notional={} min_required={}",
+            risk_capped_notional_usd,
+            execution_cfg.min_order_notional_usd
+        );
+    } else if !report.accepted && can_open_new_position && !risk.allowed {
+        report.status = format!("skipped:risk_rejected {}", risk.reason);
+    }
+
     let entry_signal = can_open_new_position && signal.should_trade && risk.allowed && report.accepted;
-    let exit_signal = has_open_positions
-        && (reversal_signal || !signal.should_trade || !risk.allowed || !pm_fresh || !bn_fresh);
+    let hold_strong_edge_bps = env_f64("HOLD_STRONG_EDGE_BPS", (signal_cfg.min_edge_bps * 0.6).max(1.0));
+    let strong_same_direction = has_open_positions
+        && open_direction
+            .map(|d| signal.direction == d && signal.net_edge_bps >= hold_strong_edge_bps)
+            .unwrap_or(false);
+
+    if !report.accepted && has_open_positions && strong_same_direction {
+        report.status = format!(
+            "hold:strong_direction net_edge_bps={:.2} hold_threshold_bps={:.2}",
+            signal.net_edge_bps, hold_strong_edge_bps
+        );
+    }
+
+    let close_reason = if reversal_signal {
+        Some("reverse_signal".to_string())
+    } else if has_open_positions && !signal.should_trade && !strong_same_direction {
+        Some("signal_invalidated".to_string())
+    } else if has_open_positions && !pm_fresh {
+        Some("stale_polymarket".to_string())
+    } else if has_open_positions && !bn_fresh {
+        Some("stale_binance".to_string())
+    } else {
+        None
+    };
+    let exit_signal = close_reason.is_some();
+
+    let position_signal = if entry_signal {
+        match signal.direction {
+            TradeDirection::Up => "open_up",
+            TradeDirection::Down => "open_down",
+            TradeDirection::Flat => "open_flat",
+        }
+        .to_string()
+    } else if has_open_positions && strong_same_direction {
+        "hold_strong_direction".to_string()
+    } else if exit_signal {
+        match open_direction.unwrap_or(TradeDirection::Flat) {
+            TradeDirection::Up => "close_up",
+            TradeDirection::Down => "close_down",
+            TradeDirection::Flat => "close",
+        }
+        .to_string()
+    } else {
+        "hold".to_string()
+    };
+
     let action = if !pm_fresh {
         "hold_stale_polymarket"
     } else if !bn_fresh {
         "hold_stale_binance_depth"
+    } else if blocked_last_seconds_5m && can_open_new_position {
+        "hold_last_seconds_5m_guard"
+    } else if has_open_positions && strong_same_direction {
+        "hold_strong_direction"
     } else if reversal_signal {
         "close_on_reversal"
     } else if entry_signal {
@@ -467,6 +570,10 @@ async fn run_iteration(
         direction: format!("{:?}", signal.direction),
         risk_allowed: risk.allowed,
         action: action.to_string(),
+        position_signal: position_signal.clone(),
+        entry_signal,
+        exit_signal,
+        close_reason: close_reason.clone().unwrap_or_else(|| "none".to_string()),
         execution_status: report.status.clone(),
         open_positions,
         day_pnl_usd,
@@ -503,19 +610,7 @@ async fn run_iteration(
         position: None,
         state,
         close_open_positions: exit_signal,
-        close_reason: if reversal_signal {
-            Some("reverse_signal".to_string())
-        } else if !signal.should_trade {
-            Some("signal_invalidated".to_string())
-        } else if !risk.allowed {
-            Some("risk_rejected".to_string())
-        } else if !pm_fresh {
-            Some("stale_polymarket".to_string())
-        } else if !bn_fresh {
-            Some("stale_binance".to_string())
-        } else {
-            None
-        },
+        close_reason,
     })
 }
 
@@ -653,6 +748,10 @@ fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
         direction: "Flat".to_string(),
         risk_allowed: false,
         action: "waiting_quotes".to_string(),
+        position_signal: "waiting".to_string(),
+        entry_signal: false,
+        exit_signal: false,
+        close_reason: "none".to_string(),
         execution_status: "waiting".to_string(),
         open_positions,
         day_pnl_usd,
@@ -805,6 +904,8 @@ fn close_positions_now(
             quantity: pos.quantity,
             entry_price: pos.entry_price,
             exit_price: close_price,
+            entry_probability: pos.entry_price.clamp(0.0, 1.0),
+            exit_probability: close_price.clamp(0.0, 1.0),
             entry_notional_usd: pos.entry_notional_usd,
             exit_notional_usd,
             pnl_usd,
@@ -873,6 +974,8 @@ fn settle_expired_positions(
                 quantity: pos.quantity,
                 entry_price: pos.entry_price,
                 exit_price,
+                entry_probability: pos.entry_price.clamp(0.0, 1.0),
+                exit_probability: exit_price.clamp(0.0, 1.0),
                 entry_notional_usd: pos.entry_notional_usd,
                 exit_notional_usd,
                 pnl_usd: pos.expected_pnl_usd,
@@ -926,6 +1029,36 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn capped_entry_notional_usd(
+    requested_notional_usd: f64,
+    current_gross_exposure_usd: f64,
+    risk_limits: RiskLimits,
+    account_equity_usd: f64,
+) -> f64 {
+    if !requested_notional_usd.is_finite() || requested_notional_usd <= 0.0 {
+        return 0.0;
+    }
+
+    let remaining_notional_cap = (risk_limits.max_notional_usd - current_gross_exposure_usd).max(0.0);
+    let leverage_cap_usd = (risk_limits.max_leverage * account_equity_usd).max(0.0);
+    let remaining_leverage_cap = (leverage_cap_usd - current_gross_exposure_usd).max(0.0);
+
+    requested_notional_usd
+        .min(remaining_notional_cap)
+        .min(remaining_leverage_cap)
+        .max(0.0)
+}
+
+fn is_last_seconds_of_five_min_window(now_ms: u64, block_last_seconds: u64) -> bool {
+    if block_last_seconds == 0 {
+        return false;
+    }
+
+    let window_ms = 5 * 60 * 1000;
+    let block_ms = block_last_seconds.saturating_mul(1_000).min(window_ms - 1);
+    let elapsed_in_window = now_ms % window_ms;
+    elapsed_in_window >= (window_ms - block_ms)
+}
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1094,6 +1227,79 @@ mod tests {
 
         let portfolio_down = build_portfolio_position(&[down_pos]);
         assert!(portfolio_down.qty < 0.0, "DOWN portfolio qty should be negative");
+    }
+
+    #[tokio::test]
+    async fn open_position_is_not_force_closed_by_entry_risk_check() {
+        let now = now_ms();
+        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
+
+        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
+
+        let opened = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            0.0,
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+        )
+        .await
+        .expect("open iteration should succeed");
+
+        let pos = opened.position.expect("expected initial UP position");
+        let now2 = now + 500;
+        pm_tx.send_replace(Some(q("polymarket", 0.20, now2)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now2)));
+
+        let hold = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            1,
+            Some(TradeDirection::Up),
+            pos.entry_notional_usd.abs(),
+            pos.entry_notional_usd.abs(),
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+        )
+        .await
+        .expect("hold iteration should succeed");
+
+        assert!(!hold.close_open_positions, "existing position should not be force-closed");
+        assert!(hold.close_reason.is_none(), "no risk_rejected close expected");
+        assert!(hold.position.is_none(), "should not open a second position while one is live");
+    }
+
+    #[test]
+    fn caps_notional_from_risk_limits() {
+        let limits = test_risk_limits();
+        let capped = capped_entry_notional_usd(10.0, 95.0, limits, 100.0);
+        assert!(capped <= 5.0 + f64::EPSILON, "capped={}", capped);
+    }
+
+    #[test]
+    fn detects_last_seconds_of_five_min_window() {
+        let window_ms = 5 * 60 * 1000;
+        assert!(!is_last_seconds_of_five_min_window(window_ms - 16_000, 15));
+        assert!(is_last_seconds_of_five_min_window(window_ms - 10_000, 15));
     }
 }
 

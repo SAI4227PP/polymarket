@@ -31,6 +31,10 @@ type traderState struct {
 	Direction       string  `json:"direction"`
 	RiskAllowed     bool    `json:"risk_allowed"`
 	Action          string  `json:"action"`
+	PositionSignal  string  `json:"position_signal"`
+	EntrySignal     bool    `json:"entry_signal"`
+	ExitSignal      bool    `json:"exit_signal"`
+	CloseReason     string  `json:"close_reason"`
 	ExecutionStatus string  `json:"execution_status"`
 	OpenPositions   int     `json:"open_positions"`
 	DayPnlUSD       float64 `json:"day_pnl_usd"`
@@ -49,6 +53,8 @@ type completedTrade struct {
 	Quantity         float64 `json:"quantity"`
 	EntryPrice       float64 `json:"entry_price"`
 	ExitPrice        float64 `json:"exit_price"`
+	EntryProbability float64 `json:"entry_probability"`
+	ExitProbability  float64 `json:"exit_probability"`
 	EntryNotionalUSD float64 `json:"entry_notional_usd"`
 	ExitNotionalUSD  float64 `json:"exit_notional_usd"`
 	PnlUSD           float64 `json:"pnl_usd"`
@@ -251,9 +257,13 @@ func main() {
 				"binance_mid":    nil,
 			}
 			signalSection := map[string]interface{}{
-				"action":       snap.Report.Action,
-				"risk_allowed": snap.Report.RiskAllowed,
-				"tick_seq":     snap.Report.TickSeq,
+				"action":          snap.Report.Action,
+				"risk_allowed":    snap.Report.RiskAllowed,
+				"tick_seq":        snap.Report.TickSeq,
+				"position_signal": "unknown",
+				"entry_signal":    false,
+				"exit_signal":     false,
+				"close_reason":    "none",
 			}
 			execSection := map[string]interface{}{
 				"open_trades":         snap.Report.OpenTrades,
@@ -271,6 +281,10 @@ func main() {
 				signalSection["net_edge_bps"] = state.NetEdgeBps
 				signalSection["direction"] = state.Direction
 				signalSection["risk_allowed"] = state.RiskAllowed
+				signalSection["position_signal"] = state.PositionSignal
+				signalSection["entry_signal"] = state.EntrySignal
+				signalSection["exit_signal"] = state.ExitSignal
+				signalSection["close_reason"] = state.CloseReason
 
 				execSection["execution_status"] = state.ExecutionStatus
 				execSection["open_positions"] = state.OpenPositions
