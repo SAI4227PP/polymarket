@@ -1,0 +1,13 @@
+[package]
+name = "trader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adapters-polymarket = { path = "../adapters-polymarket" }
+adapters-binance = { path = "../adapters-binance" }
+strategy-engine = { path = "../strategy-engine" }
+risk-engine = { path = "../risk-engine" }
+execution-engine = { path = "../execution-engine" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"

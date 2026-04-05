@@ -1,0 +1,4 @@
+max_notional_usd: 1000
+max_daily_loss_usd: 100
+max_open_positions: 3
+kill_switch_drawdown_pct: 5.0
