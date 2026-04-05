@@ -73,6 +73,112 @@ impl MarketSubscription {
     }
 }
 
+fn first_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+pub async fn resolve_instrument_id_from_env() -> Result<String> {
+    if let Some(asset_id) = first_non_empty_env("POLYMARKET_ASSET_ID") {
+        return Ok(asset_id);
+    }
+    if let Some(market_id) = first_non_empty_env("POLYMARKET_MARKET_ID") {
+        return Ok(market_id);
+    }
+
+    if let Some(event_url) = first_non_empty_env("POLYMARKET_EVENT_URL") {
+        let parsed = Url::parse(&event_url).context("invalid POLYMARKET_EVENT_URL")?;
+        let parts: Vec<&str> = parsed
+            .path_segments()
+            .map(|s| s.collect())
+            .unwrap_or_default();
+
+        let event_idx = parts.iter().position(|p| *p == "event");
+        if let Some(idx) = event_idx {
+            if idx + 1 < parts.len() {
+                let event_slug = parts[idx + 1];
+                let preferred_market_slug = if idx + 2 < parts.len() {
+                    let s = parts[idx + 2].trim();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                };
+                return resolve_market_id_from_event_slug(event_slug, preferred_market_slug).await;
+            }
+        }
+        bail!("POLYMARKET_EVENT_URL must look like /event/{{event-slug}}[/market-slug]");
+    }
+
+    if let Some(event_slug) = first_non_empty_env("POLYMARKET_EVENT_SLUG") {
+        return resolve_market_id_from_event_slug(&event_slug, None).await;
+    }
+
+    bail!("missing non-empty POLYMARKET_ASSET_ID or POLYMARKET_MARKET_ID or POLYMARKET_EVENT_URL or POLYMARKET_EVENT_SLUG");
+}
+
+async fn resolve_market_id_from_event_slug(event_slug: &str, preferred_market_slug: Option<&str>) -> Result<String> {
+    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/events/slug/{event_slug}");
+
+    let payload: Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma event request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma event request non-success: {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("gamma event decode failed: {url}"))?;
+
+    let markets = payload
+        .get("markets")
+        .and_then(Value::as_array)
+        .context("gamma event payload missing markets")?;
+
+    let pick = if let Some(mslug) = preferred_market_slug {
+        markets.iter().find(|m| m.get("slug").and_then(Value::as_str) == Some(mslug))
+    } else {
+        markets
+            .iter()
+            .filter_map(|m| {
+                let active = m.get("active").and_then(Value::as_bool).unwrap_or(false);
+                let closed = m.get("closed").and_then(Value::as_bool).unwrap_or(false);
+                let vol = m.get("volumeNum").and_then(Value::as_f64).or_else(|| {
+                    m.get("volume")
+                        .and_then(Value::as_str)
+                        .and_then(|s| s.parse::<f64>().ok())
+                }).unwrap_or(0.0);
+                Some((m, if active { 2 } else { 0 } + if !closed { 1 } else { 0 }, vol))
+            })
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)))
+            .map(|(m,_,_)| m)
+    };
+
+    let market = pick.context("no market found for event slug")?;
+
+    if let Some(cid) = market.get("conditionId").and_then(Value::as_str) {
+        let cid = cid.trim();
+        if cid.starts_with("0x") && !cid.is_empty() {
+            return Ok(cid.to_string());
+        }
+    }
+
+    if let Some(mid) = market.get("id").and_then(Value::as_str) {
+        let mid = mid.trim();
+        if mid.starts_with("0x") && !mid.is_empty() {
+            return Ok(mid.to_string());
+        }
+    }
+
+    bail!("resolved market is missing a usable 0x market identifier");
+}
+
 pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
         .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());
@@ -549,3 +655,4 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+

@@ -60,17 +60,9 @@ struct TraderState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let pm_instrument_id = std::env::var("POLYMARKET_ASSET_ID")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("POLYMARKET_MARKET_ID")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        })
-        .context("missing non-empty POLYMARKET_ASSET_ID or POLYMARKET_MARKET_ID")?;
+    let pm_instrument_id = polymarket_ws::resolve_instrument_id_from_env()
+        .await
+        .context("missing non-empty POLYMARKET_ASSET_ID/POLYMARKET_MARKET_ID or resolvable POLYMARKET_EVENT_URL/POLYMARKET_EVENT_SLUG")?;
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
 
     let loop_ms = env_u64("LOOP_INTERVAL_MS", 1_000);
