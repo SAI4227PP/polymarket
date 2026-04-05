@@ -47,14 +47,17 @@ pub fn build_order_intent(
         return None;
     }
 
-    let target_notional_usd = order_notional_usd.max(cfg.min_order_notional_usd);
-    let max_notional_usd = target_notional_usd.min(cfg.demo_wallet_balance_usd);
-    if max_notional_usd < cfg.min_order_notional_usd {
+    let base_target_notional_usd = order_notional_usd.max(cfg.min_order_notional_usd);
+    // Pre-size notional so minimum-share orders can pass when affordable.
+    let pre_slippage_notional_usd = base_target_notional_usd
+        .max(cfg.min_order_shares * ref_price)
+        .min(cfg.demo_wallet_balance_usd);
+    if pre_slippage_notional_usd < cfg.min_order_notional_usd {
         return None;
     }
 
     let slippage_bps = estimate_slippage_bps(
-        max_notional_usd,
+        pre_slippage_notional_usd,
         top_book_liquidity_usd,
         realized_vol_bps,
         cfg.slippage_model,
@@ -66,9 +69,20 @@ pub fn build_order_intent(
         return None;
     }
 
-    let qty_by_notional = max_notional_usd / limit_price;
+    let required_notional_usd = cfg
+        .min_order_notional_usd
+        .max(cfg.min_order_shares * limit_price);
+    let budget_notional_usd = pre_slippage_notional_usd
+        .max(required_notional_usd)
+        .min(cfg.demo_wallet_balance_usd);
+    if budget_notional_usd < required_notional_usd {
+        return None;
+    }
+
+    let qty_by_notional = budget_notional_usd / limit_price;
     let qty_by_wallet = cfg.demo_wallet_balance_usd / limit_price;
-    let final_qty = scaled_qty.min(qty_by_notional).min(qty_by_wallet);
+    let desired_qty = scaled_qty.max(cfg.min_order_shares);
+    let final_qty = desired_qty.min(qty_by_notional).min(qty_by_wallet);
 
     if final_qty < cfg.min_order_shares {
         return None;
@@ -115,3 +129,69 @@ pub fn size_from_edge_bps(net_edge_bps: f64, base_qty: f64, threshold_bps: f64) 
     base_qty * (0.25 + 0.25 * score)
 }
 
+
+
+#[cfg(test)]
+mod tests {
+    use super::{build_order_intent, ExecutionConfig};
+    use common::{Signal, TradeDirection};
+
+    fn signal_up() -> Signal {
+        Signal {
+            edge_bps: 100.0,
+            net_edge_bps: 80.0,
+            should_trade: true,
+            direction: TradeDirection::Up,
+        }
+    }
+
+    #[test]
+    fn builds_order_by_raising_notional_to_min_shares_requirement() {
+        let cfg = ExecutionConfig {
+            base_qty: 1.0,
+            edge_threshold_bps: 1.0,
+            demo_wallet_balance_usd: 10.0,
+            min_order_notional_usd: 1.0,
+            min_order_shares: 5.0,
+            ..ExecutionConfig::default()
+        };
+
+        let intent = build_order_intent(
+            "BTC",
+            &signal_up(),
+            0.57,
+            1.0,
+            5_000.0,
+            30.0,
+            cfg,
+        )
+        .expect("expected order intent");
+
+        assert!(intent.quantity >= 5.0, "qty={} price={}", intent.quantity, intent.limit_price);
+        assert!(intent.quantity * intent.limit_price >= 1.0);
+    }
+
+    #[test]
+    fn skips_when_wallet_cannot_fund_min_shares() {
+        let cfg = ExecutionConfig {
+            base_qty: 1.0,
+            edge_threshold_bps: 1.0,
+            demo_wallet_balance_usd: 2.0,
+            min_order_notional_usd: 1.0,
+            min_order_shares: 5.0,
+            ..ExecutionConfig::default()
+        };
+
+        let intent = build_order_intent(
+            "BTC",
+            &signal_up(),
+            0.57,
+            1.0,
+            5_000.0,
+            30.0,
+            cfg,
+        );
+
+        assert!(intent.is_none());
+    }
+}
