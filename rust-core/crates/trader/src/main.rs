@@ -7,6 +7,7 @@ use redis::{aio::MultiplexedConnection, AsyncCommands};
 use risk_engine::kill_switch::{should_kill, KillSwitchConfig, KillSwitchState};
 use risk_engine::limits::{evaluate_trade, RiskInput, RiskLimits};
 use serde::Serialize;
+use serde_json::json;
 use strategy_engine::signals::{compute_signal, SignalConfig};
 use tokio::sync::watch;
 use tokio::time::{interval, sleep, Duration};
@@ -72,6 +73,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "trader:state:latest".to_string());
     let redis_final_trades_key = std::env::var("REDIS_FINAL_TRADES_KEY")
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
+    let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
+        .unwrap_or_else(|_| "trader:live_btc:latest".to_string());
+    let redis_past_outcomes_key = std::env::var("REDIS_PAST_OUTCOMES_KEY")
+        .unwrap_or_else(|_| "trader:past_outcomes:latest".to_string());
+    let configured_event_slug = std::env::var("POLYMARKET_EVENT_SLUG").unwrap_or_default();
     let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
 
     let signal_cfg = SignalConfig {
@@ -125,11 +131,19 @@ async fn main() -> Result<()> {
     let mut day_pnl_usd = 0.0;
     let mut pending_positions: Vec<PendingPosition> = Vec::new();
     let mut trade_history: Vec<CompletedTrade> = Vec::new();
+    let mut last_past_probability: Option<f64> = None;
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
 
     loop {
         ticker.tick().await;
+        let pm_snapshot = pm_rx.borrow().clone();
+        let bn_snapshot = bn_rx.borrow().clone();
+        if let Some(q) = pm_snapshot.as_ref() {
+            if q.venue == "polymarket-past-results" {
+                last_past_probability = Some(q.price.clamp(0.0, 1.0));
+            }
+        }
 
         let closed = settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
         if !closed.is_empty() {
@@ -183,6 +197,20 @@ async fn main() -> Result<()> {
                 .await
                 {
                     eprintln!("redis trade-history publish error: {err:#}");
+                }
+                if let Err(err) = publish_aux_stream_payloads_to_redis(
+                    &redis_url,
+                    &redis_live_btc_key,
+                    &redis_past_outcomes_key,
+                    &configured_event_slug,
+                    pm_snapshot.clone(),
+                    bn_snapshot.clone(),
+                    last_past_probability,
+                    &mut redis_conn,
+                )
+                .await
+                {
+                    eprintln!("redis aux-stream publish error: {err:#}");
                 }
             }
             Err(err) => {
@@ -443,6 +471,72 @@ async fn publish_trades_to_redis(
     Ok(())
 }
 
+async fn publish_aux_stream_payloads_to_redis(
+    redis_url: &str,
+    live_btc_key: &str,
+    past_outcomes_key: &str,
+    event_slug: &str,
+    pm_quote: Option<Quote>,
+    bn_quote: Option<Quote>,
+    last_past_probability: Option<f64>,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    let live_btc_payload = if let Some(q) = bn_quote {
+        json!({
+            "source": q.venue,
+            "symbol": q.symbol,
+            "price": q.price,
+            "ts_ms": q.ts_ms
+        })
+    } else {
+        json!({ "warning": "live btc unavailable" })
+    };
+
+    let derived_event_slug = if !event_slug.trim().is_empty() {
+        event_slug.to_string()
+    } else {
+        pm_quote.map(|q| q.symbol).unwrap_or_default()
+    };
+
+    let past_outcomes_payload = if let Some(p) = last_past_probability {
+        json!({
+            "source": "polymarket-past-results",
+            "event_slug": derived_event_slug,
+            "probability_up": p,
+            "ts_ms": now_ms()
+        })
+    } else {
+        json!({ "warning": "past outcomes unavailable" })
+    };
+
+    if let Some(c) = conn.as_mut() {
+        let live_payload = serde_json::to_string(&live_btc_payload).context("serialize live btc payload")?;
+        let past_payload = serde_json::to_string(&past_outcomes_payload).context("serialize past outcomes payload")?;
+
+        let live_set: redis::RedisResult<()> = c.set(live_btc_key, live_payload).await;
+        if let Err(e) = live_set {
+            *conn = None;
+            return Err(anyhow!("redis set live btc failed: {e}"));
+        }
+
+        let past_set: redis::RedisResult<()> = c.set(past_outcomes_key, past_payload).await;
+        if let Err(e) = past_set {
+            *conn = None;
+            return Err(anyhow!("redis set past outcomes failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
 fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
     TraderState {
         ts_ms: now_ms(),

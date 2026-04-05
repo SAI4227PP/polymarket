@@ -27,6 +27,42 @@ struct MarketSubscription {
     asset_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct OutcomeTokenMap {
+    up_token: Option<String>,
+    down_token: Option<String>,
+}
+
+impl OutcomeTokenMap {
+    fn from_ordered(ids: &[String]) -> Self {
+        Self {
+            up_token: ids.first().cloned(),
+            down_token: ids.get(1).cloned(),
+        }
+    }
+
+    fn up_probability_for_asset(&self, asset: &str, raw_price: f64) -> Option<f64> {
+        if self
+            .up_token
+            .as_deref()
+            .map(|id| id == asset)
+            .unwrap_or(false)
+        {
+            return Some(raw_price);
+        }
+
+        if self
+            .down_token
+            .as_deref()
+            .map(|id| id == asset)
+            .unwrap_or(false)
+        {
+            return Some(1.0 - raw_price);
+        }
+        None
+    }
+}
+
 impl MarketSubscription {
     async fn from_instrument_id(instrument_id: &str) -> Result<Self> {
         if instrument_id.starts_with("0x") {
@@ -52,7 +88,7 @@ impl MarketSubscription {
 
     fn subscribe_payload(&self) -> Value {
         let mut payload = json!({
-            "type": "market",
+            "type": "markets",
             "custom_feature_enabled": true
         });
 
@@ -473,9 +509,9 @@ fn market_ws_endpoints() -> Vec<String> {
         out.push(configured);
     }
 
-    // Prefer canonical CLOB endpoint, but keep frontend endpoint as a fallback.
-    out.push(POLYMARKET_WS_MARKET_CLOB.to_string());
+    // Prefer frontend market stream for asset-id subscriptions.
     out.push(POLYMARKET_WS_MARKET_FRONTEND.to_string());
+    out.push(POLYMARKET_WS_MARKET_CLOB.to_string());
 
     let mut deduped = Vec::new();
     for endpoint in out {
@@ -704,6 +740,8 @@ async fn stream_live_data_activity_quote(instrument_id: &str, gamma_prob: Option
         .await
         .context("failed to subscribe to polymarket live-data activity")?;
 
+    let event_slug = event_slug_for_subscription();
+    let outcome_tokens = resolve_outcome_token_map(instrument_id, &event_slug).await;
     let mut chainlink_anchor: Option<f64> = None;
     let mut chainlink_latest: Option<f64> = None;
     let debug_ws = ws_debug_enabled();
@@ -740,7 +778,7 @@ async fn stream_live_data_activity_quote(instrument_id: &str, gamma_prob: Option
                     continue;
                 }
 
-                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id) {
+                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id, outcome_tokens.as_ref()) {
                     if let Some(p) = blended_probability(Some(q.price), gamma_prob, past_prob) {
                         q.bid = p;
                         q.ask = p;
@@ -810,6 +848,8 @@ async fn run_live_data_activity_quote_stream(
         .await
         .context("failed to subscribe to polymarket live-data streams")?;
 
+    let event_slug = event_slug_for_subscription();
+    let outcome_tokens = resolve_outcome_token_map(instrument_id, &event_slug).await;
     let mut chainlink_anchor: Option<f64> = None;
     let mut chainlink_latest: Option<f64> = None;
     let debug_ws = ws_debug_enabled();
@@ -846,7 +886,7 @@ async fn run_live_data_activity_quote_stream(
                     continue;
                 }
 
-                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id) {
+                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id, outcome_tokens.as_ref()) {
                     if let Some(p) = blended_probability(Some(q.price), gamma_prob, past_prob) {
                         q.bid = p;
                         q.ask = p;
@@ -920,11 +960,8 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
                 let payload: Value = serde_json::from_str(&text)
                     .context("failed to parse polymarket live-data message")?;
                 if let Some(q) = parse_live_data_quote(&payload) {
-                    if debug_ws {
-                        eprintln!("polymarket ws quote source=activity+blend market={} prob={:.4} gamma={:?} past={:?} chainlink_anchor={:?} chainlink_latest={:?}", q.symbol, q.price, gamma_prob, past_prob, chainlink_anchor, chainlink_latest);
-                    }
-
-                    return Ok(q);                }
+                    return Ok(q);
+                }
             }
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
@@ -1235,6 +1272,29 @@ async fn fetch_market_asset_ids_from_gamma(client: &reqwest::Client, url: &str) 
     Ok(ids)
 }
 
+async fn fetch_market_outcome_token_map_from_gamma(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<OutcomeTokenMap> {
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma request failed: {url}"))?;
+
+    if !resp.status().is_success() {
+        bail!("gamma request non-success status {} for {}", resp.status(), url);
+    }
+
+    let payload: Value = resp
+        .json()
+        .await
+        .with_context(|| format!("gamma response json decode failed: {url}"))?;
+
+    parse_market_outcome_token_map_from_gamma_payload(&payload)
+        .context("gamma response had no outcome token map")
+}
 fn parse_market_asset_ids_from_gamma_payload(payload: &Value) -> Vec<String> {
     match payload {
         Value::Object(_) => parse_market_asset_ids_from_gamma_market(payload),
@@ -1278,6 +1338,105 @@ fn parse_market_asset_ids_from_gamma_market(v: &Value) -> Vec<String> {
     out
 }
 
+fn parse_market_outcome_token_map_from_gamma_payload(payload: &Value) -> Option<OutcomeTokenMap> {
+    match payload {
+        Value::Object(_) => parse_market_outcome_token_map_from_gamma_market(payload),
+        Value::Array(items) => items
+            .iter()
+            .find_map(parse_market_outcome_token_map_from_gamma_market),
+        _ => None,
+    }
+}
+
+fn parse_market_outcome_token_map_from_gamma_market(v: &Value) -> Option<OutcomeTokenMap> {
+    let ids = parse_market_asset_ids_from_gamma_market(v);
+    if ids.is_empty() {
+        return None;
+    }
+
+    let outcomes = parse_market_outcome_labels(v);
+    if outcomes.is_empty() {
+        return Some(OutcomeTokenMap::from_ordered(&ids));
+    }
+
+    let mut map = OutcomeTokenMap::default();
+    for (idx, label) in outcomes.iter().enumerate() {
+        let token = match ids.get(idx) {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        if label.eq_ignore_ascii_case("up") || label.eq_ignore_ascii_case("yes") {
+            map.up_token = Some(token);
+        } else if label.eq_ignore_ascii_case("down") || label.eq_ignore_ascii_case("no") {
+            map.down_token = Some(token);
+        }
+    }
+
+    if map.up_token.is_none() && map.down_token.is_none() {
+        return Some(OutcomeTokenMap::from_ordered(&ids));
+    }
+
+    if map.up_token.is_none() {
+        map.up_token = ids.first().cloned();
+    }
+    if map.down_token.is_none() {
+        map.down_token = ids.get(1).cloned();
+    }
+    Some(map)
+}
+
+fn parse_market_outcome_labels(v: &Value) -> Vec<String> {
+    if let Some(arr) = v.get("outcomes").and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    if let Some(s) = v.get("outcomes").and_then(Value::as_str) {
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
+            return arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+async fn resolve_outcome_token_map(
+    instrument_id: &str,
+    event_slug: &str,
+) -> Option<OutcomeTokenMap> {
+    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+    let base = base.trim_end_matches('/');
+    let client = reqwest::Client::new();
+
+    let by_slug_query = format!("{base}/markets?slug={event_slug}");
+    if let Ok(map) = fetch_market_outcome_token_map_from_gamma(&client, &by_slug_query).await {
+        return Some(map);
+    }
+
+    let by_slug_path = format!("{base}/markets/slug/{event_slug}");
+    if let Ok(map) = fetch_market_outcome_token_map_from_gamma(&client, &by_slug_path).await {
+        return Some(map);
+    }
+
+    if instrument_id.starts_with("0x") {
+        if let Ok(ids) = resolve_market_asset_ids(instrument_id).await {
+            if !ids.is_empty() {
+                return Some(OutcomeTokenMap::from_ordered(&ids));
+            }
+        }
+    }
+    None
+}
 fn parse_quote_from_payload(
     payload: &Value,
     subscription: &MarketSubscription,
@@ -1326,8 +1485,8 @@ fn parse_quote_from_event(
 
             let bids = payload.get("bids")?.as_array()?;
             let asks = payload.get("asks")?.as_array()?;
-            let bid = bids.first()?.get("price").and_then(parse_price)?;
-            let ask = asks.first()?.get("price").and_then(parse_price)?;
+            let bid = best_bid_from_book_levels(bids)?;
+            let ask = best_ask_from_book_levels(asks)?;
             (event_asset.to_string(), bid, ask)
         }
         "price_change" => parse_price_change_bid_ask(payload, subscription, preferred_asset)?,
@@ -1391,6 +1550,21 @@ fn parse_price_change_bid_ask(
     candidates.into_iter().next()
 }
 
+fn best_bid_from_book_levels(levels: &[Value]) -> Option<f64> {
+    levels
+        .iter()
+        .filter_map(|level| level.get("price").and_then(parse_price))
+        .filter(|p| p.is_finite())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn best_ask_from_book_levels(levels: &[Value]) -> Option<f64> {
+    levels
+        .iter()
+        .filter_map(|level| level.get("price").and_then(parse_price))
+        .filter(|p| p.is_finite())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+}
 fn parse_live_data_quote(payload: &Value) -> Option<Quote> {
     let topic = payload.get("topic").and_then(Value::as_str)?;
     if topic != "crypto_prices" && topic != "crypto_prices_chainlink" {
@@ -1459,7 +1633,11 @@ fn chainlink_trend_bias(anchor: Option<f64>, latest: Option<f64>) -> Option<f64>
     let ret = (latest - anchor) / anchor;
     Some((ret * 4.0).clamp(-0.03, 0.03))
 }
-fn parse_activity_quote_from_live_data(payload: &Value, instrument_id: &str) -> Option<Quote> {
+fn parse_activity_quote_from_live_data(
+    payload: &Value,
+    instrument_id: &str,
+    outcome_tokens: Option<&OutcomeTokenMap>,
+) -> Option<Quote> {
     let topic = payload.get("topic").and_then(Value::as_str)?;
     let msg_type = payload.get("type").and_then(Value::as_str)?;
     if topic != "activity" || msg_type != "orders_matched" {
@@ -1487,15 +1665,19 @@ fn parse_activity_quote_from_live_data(payload: &Value, instrument_id: &str) -> 
 
     let outcome_index = item.get("outcomeIndex").and_then(Value::as_i64);
     let outcome = item.get("outcome").and_then(Value::as_str);
-
-    let up_probability = match (outcome_index, outcome) {
-        (Some(0), _) => raw_price,
-        (Some(1), _) => 1.0 - raw_price,
-        (_, Some(label)) if label.eq_ignore_ascii_case("up") => raw_price,
-        (_, Some(label)) if label.eq_ignore_ascii_case("down") => 1.0 - raw_price,
-        _ => raw_price,
-    }
-    .clamp(0.0, 1.0);
+    let up_probability = outcome_tokens
+        .and_then(|m| m.up_probability_for_asset(asset, raw_price))
+        .or_else(|| match (outcome_index, outcome) {
+            (Some(0), _) => Some(raw_price),
+            (Some(1), _) => Some(1.0 - raw_price),
+            (_, Some(label)) if label.eq_ignore_ascii_case("up") => Some(raw_price),
+            (_, Some(label)) if label.eq_ignore_ascii_case("yes") => Some(raw_price),
+            (_, Some(label)) if label.eq_ignore_ascii_case("down") => Some(1.0 - raw_price),
+            (_, Some(label)) if label.eq_ignore_ascii_case("no") => Some(1.0 - raw_price),
+            _ => None,
+        })
+        .unwrap_or(raw_price)
+        .clamp(0.0, 1.0);
 
     Some(Quote {
         venue: "polymarket-live-data".to_string(),
@@ -1529,4 +1711,3 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
