@@ -33,6 +33,14 @@ type RunReport struct {
 	RiskAllowed bool      `json:"risk_allowed"`
 }
 
+type Snapshot struct {
+	GeneratedAt time.Time            `json:"generated_at"`
+	Config      Config               `json:"config"`
+	Report      RunReport            `json:"report"`
+	Metrics     []monitoring.Metric  `json:"metrics"`
+	Trades      []storage.TradeRecord `json:"trades"`
+}
+
 type Service struct {
 	cfg       Config
 	scheduler *Scheduler
@@ -85,6 +93,28 @@ func (s *Service) RunOnce(ctx context.Context) (RunReport, error) {
 		return err
 	})
 	return report, err
+}
+
+func (s *Service) Snapshot(ctx context.Context, limit int, status storage.TradeStatus) (Snapshot, error) {
+	report, err := s.RunOnce(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{
+		GeneratedAt: time.Now().UTC(),
+		Config:      s.cfg,
+		Report:      report,
+		Metrics:     s.metrics.Snapshot(),
+		Trades:      s.repo.ListTradesByStatus(status, limit),
+	}, nil
+}
+
+func (s *Service) Config() Config {
+	return s.cfg
+}
+
+func (s *Service) Trades(limit int, status storage.TradeStatus) []storage.TradeRecord {
+	return s.repo.ListTradesByStatus(status, limit)
 }
 
 func (s *Service) iteration(t Tick) (RunReport, error) {

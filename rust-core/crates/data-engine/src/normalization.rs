@@ -19,3 +19,20 @@ pub fn binance_price_to_prob(binance_price: f64, anchor_price: f64) -> f64 {
     }
     clamp_probability(binance_price / anchor_price)
 }
+
+pub fn logit(probability: f64) -> f64 {
+    let p = clamp_probability(probability).clamp(1e-9, 1.0 - 1e-9);
+    (p / (1.0 - p)).ln()
+}
+
+pub fn inv_logit(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+pub fn implied_probability_from_yes_no(yes_price: f64, no_price: f64) -> f64 {
+    let denom = yes_price + no_price;
+    if denom <= 0.0 {
+        return 0.5;
+    }
+    clamp_probability(yes_price / denom)
+}

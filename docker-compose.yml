@@ -7,8 +7,46 @@ services:
       POSTGRES_DB: polymarket
     ports:
       - "5432:5432"
+    restart: unless-stopped
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile.api
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+      - trader
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  supervisor:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile.supervisor
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  trader:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile.trader
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped

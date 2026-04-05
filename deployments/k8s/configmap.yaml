@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: polymarket-config
+  namespace: polymarket-bot
+data:
+  MODE: "paper"
+  BINANCE_SYMBOL: "BTCUSDT"
+  LOOP_INTERVAL_MS: "1000"
+  MIN_EDGE_BPS: "8"
+  ORDER_QTY: "10"
+  ORDER_NOTIONAL_USD: "100"
+  POSITION_TTL_MS: "10000"
+  BINANCE_ANCHOR_PRICE: "100000"
+  BINANCE_BASIS_BPS: "0"
+  MAX_NOTIONAL_USD: "1000"
+  MAX_DAILY_LOSS_USD: "100"
+  MAX_OPEN_POSITIONS: "3"
+  KILL_SWITCH_DRAWDOWN_PCT: "5"
+  KILL_SWITCH_ERROR_STREAK: "5"
+  CURRENT_DRAWDOWN_PCT: "0"
+  POLYMARKET_MARKET_WS_URL: "wss://ws-subscriptions-frontend-clob.polymarket.com/ws/market"
+  REDIS_URL: "redis://redis:6379"
+  REDIS_TRADER_STATE_KEY: "trader:state:latest"
+  REDIS_SNAPSHOT_KEY: "api:snapshot:latest"
+  REDIS_STATUS_KEY: "api:status:latest"
+  REDIS_METRICS_KEY: "api:metrics:latest"
+  REDIS_TRADES_KEY: "api:trades:latest"
+  REDIS_CONFIG_KEY: "api:config:latest"

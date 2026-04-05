@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supervisor
+  namespace: polymarket-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: supervisor
+  template:
+    metadata:
+      labels:
+        app: supervisor
+    spec:
+      containers:
+        - name: supervisor
+          image: polymarket-bot-supervisor:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: polymarket-config

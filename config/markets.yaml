@@ -1,3 +1,7 @@
 pair: BTC
-polymarket_market_id: "REPLACE_WITH_MARKET_ID"
+polymarket_asset_id: ""
+polymarket_market_id: ""
+polymarket_market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 binance_symbol: "BTCUSDT"
+binance_ws_url: "wss://stream.binance.com:9443/ws"
+

@@ -2,3 +2,5 @@ mode: paper
 log_level: info
 symbol: BTC
 loop_interval_ms: 1000
+position_ttl_ms: 10000
+api_port: 8080

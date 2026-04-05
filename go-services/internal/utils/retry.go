@@ -38,6 +38,9 @@ func Retry(ctx context.Context, cfg RetryConfig, fn func(attempt int) error) err
 	if cfg.Multiplier < 1 {
 		cfg.Multiplier = 1
 	}
+	if cfg.Jitter < 0 {
+		cfg.Jitter = 0
+	}
 
 	delay := cfg.InitialDelay
 	var lastErr error
@@ -51,7 +54,10 @@ func Retry(ctx context.Context, cfg RetryConfig, fn func(attempt int) error) err
 			break
 		}
 
-		j := time.Duration(rand.Int63n(int64(cfg.Jitter + 1)))
+		var j time.Duration
+		if cfg.Jitter > 0 {
+			j = time.Duration(rand.Int63n(int64(cfg.Jitter) + 1))
+		}
 		sleep := delay + j
 		if sleep > cfg.MaxDelay {
 			sleep = cfg.MaxDelay

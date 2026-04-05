@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.79 as builder
+WORKDIR /workspace
+
+COPY rust-core/Cargo.toml rust-core/Cargo.toml
+COPY rust-core/crates rust-core/crates
+
+WORKDIR /workspace/rust-core
+RUN cargo build --release -p trader
+
+FROM debian:bookworm-slim
+RUN useradd -m -u 10001 trader
+WORKDIR /app
+COPY --from=builder /workspace/rust-core/target/release/trader /app/trader
+USER trader
+ENTRYPOINT ["/app/trader"]

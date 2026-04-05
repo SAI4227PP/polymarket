@@ -42,3 +42,7 @@ pub fn update_position(pos: &mut Position, fill_qty: f64, fill_price: f64) {
         }
     }
 }
+
+pub fn mark_to_market(pos: &Position, mark_price: f64) -> f64 {
+    pos.realized_pnl + (mark_price - pos.avg_price) * pos.qty
+}
