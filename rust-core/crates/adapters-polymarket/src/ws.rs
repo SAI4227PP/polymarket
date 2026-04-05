@@ -522,7 +522,7 @@ async fn run_market_quote_stream_from_endpoint(
         .await
         .context("failed to send polymarket market subscription")?;
 
-    let preferred_asset: Option<String> = None;
+    let mut preferred_asset: Option<String> = None;
 
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
