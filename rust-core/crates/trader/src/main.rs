@@ -257,6 +257,20 @@ async fn run_iteration(
         }
     };
 
+    if env_bool("TRADER_DEBUG_QUOTES", false) {
+        eprintln!(
+            "engine quotes pm={venue:{} symbol:{} price:{:.4} ts_ms:{}} bn={venue:{} symbol:{} price:{:.2} ts_ms:{}}",
+            pm_quote.venue,
+            pm_quote.symbol,
+            pm_quote.price,
+            pm_quote.ts_ms,
+            bn_quote.venue,
+            bn_quote.symbol,
+            bn_quote.price,
+            bn_quote.ts_ms
+        );
+    }
+
     let signal = compute_signal(&pm_quote, &bn_quote, signal_cfg);
     let fair_value_probability = (pm_quote.price + (signal.edge_bps / 10_000.0)).clamp(0.0, 1.0);
     let now = now_ms();
@@ -611,6 +625,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
 }
 

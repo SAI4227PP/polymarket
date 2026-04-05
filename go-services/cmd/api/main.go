@@ -58,11 +58,13 @@ type streamEnvelope struct {
 }
 
 type streamFrame struct {
-	Snapshot  runner.Snapshot        `json:"snapshot"`
-    Trades    interface{}            `json:"trades"`
-	Market    map[string]interface{} `json:"market"`
-	Signal    map[string]interface{} `json:"signal"`
-	Execution map[string]interface{} `json:"execution"`
+	Snapshot     runner.Snapshot        `json:"snapshot"`
+	Trades       interface{}            `json:"trades"`
+	LiveBTC      interface{}            `json:"live_btc"`
+	PastOutcomes interface{}            `json:"past_outcomes"`
+	Market       map[string]interface{} `json:"market"`
+	Signal       map[string]interface{} `json:"signal"`
+	Execution    map[string]interface{} `json:"execution"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -95,6 +97,8 @@ func main() {
 	configKey := getenv("REDIS_CONFIG_KEY", "api:config:latest")
 	traderStateKey := getenv("REDIS_TRADER_STATE_KEY", "trader:state:latest")
 	finalTradesKey := getenv("REDIS_FINAL_TRADES_KEY", "trader:trades:latest")
+	liveBTCKey := getenv("REDIS_LIVE_BTC_KEY", "trader:live_btc:latest")
+	pastOutcomesKey := getenv("REDIS_PAST_OUTCOMES_KEY", "trader:past_outcomes:latest")
 
 	go refreshRedisCache(logger, svc, cache, snapshotKey, statusKey, metricsKey, tradesKey, configKey)
 
@@ -207,6 +211,16 @@ func main() {
 				tradesPayload = finalTrades
 			}
 
+			var liveBTCPayload interface{}
+			if err := readCachedJSONWithTimeout(r.Context(), cache, liveBTCKey, &liveBTCPayload, 1200*time.Millisecond); err != nil {
+				liveBTCPayload = map[string]interface{}{"warning": err.Error()}
+			}
+
+			var pastOutcomesPayload interface{}
+			if err := readCachedJSONWithTimeout(r.Context(), cache, pastOutcomesKey, &pastOutcomesPayload, 1200*time.Millisecond); err != nil {
+				pastOutcomesPayload = map[string]interface{}{"warning": err.Error()}
+			}
+
 			if snapErr != nil {
 				_ = conn.WriteJSON(streamEnvelope{
 					Type:      "error",
@@ -264,11 +278,13 @@ func main() {
 				Type:      "snapshot",
 				Timestamp: time.Now().UTC(),
 				Data: streamFrame{
-					Snapshot:  snap,
-					Trades:    tradesPayload,
-					Market:    marketSection,
-					Signal:    signalSection,
-					Execution: execSection,
+					Snapshot:     snap,
+					Trades:       tradesPayload,
+					LiveBTC:      liveBTCPayload,
+					PastOutcomes: pastOutcomesPayload,
+					Market:       marketSection,
+					Signal:       signalSection,
+					Execution:    execSection,
 				},
 			}
 
@@ -412,5 +428,4 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
-
 

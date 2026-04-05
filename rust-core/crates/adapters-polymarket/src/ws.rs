@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{Datelike, Utc};
+use chrono::{Datelike, TimeZone, Utc};
 use common::Quote;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -91,6 +91,12 @@ fn first_non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn ws_debug_enabled() -> bool {
+    first_non_empty_env("POLYMARKET_WS_DEBUG")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -382,8 +388,18 @@ fn month_name(month: u32) -> &'static str {
     }
 }
 pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
-    let endpoints = market_ws_endpoints();
     let mut errors = Vec::new();
+
+    let event_slug = event_slug_for_subscription();
+    let gamma_prob = fetch_gamma_snapshot_quote(&event_slug).await.ok().map(|q| q.price);
+    let past_prob = fetch_past_outcomes_quote(&event_slug).await.ok().map(|q| q.price);
+
+    match stream_live_data_activity_quote(instrument_id, gamma_prob, past_prob).await {
+        Ok(q) => return Ok(q),
+        Err(err) => errors.push(format!("live-data: {err:#}")),
+    }
+
+    let endpoints = market_ws_endpoints();
 
     for endpoint in endpoints {
         match stream_market_quote_from_endpoint(instrument_id, &endpoint).await {
@@ -402,8 +418,40 @@ pub async fn run_market_quote_stream(
     instrument_id: &str,
     tx: watch::Sender<Option<Quote>>,
 ) -> Result<()> {
-    let endpoints = market_ws_endpoints();
     let mut errors = Vec::new();
+
+    let event_slug = event_slug_for_subscription();
+    let gamma_prob = fetch_gamma_snapshot_quote(&event_slug).await.ok().map(|q| q.price);
+    let past_prob = fetch_past_outcomes_quote(&event_slug).await.ok().map(|q| q.price);
+
+    if let Some(past) = past_prob {
+        let _ = tx.send(Some(Quote {
+            venue: "polymarket-past-results".to_string(),
+            symbol: event_slug.clone(),
+            bid: past,
+            ask: past,
+            price: past,
+            ts_ms: now_ms(),
+        }));
+    }
+
+    if let Some(seed) = blended_probability(None, gamma_prob, past_prob) {
+        let _ = tx.send(Some(Quote {
+            venue: "polymarket-prior".to_string(),
+            symbol: event_slug.clone(),
+            bid: seed,
+            ask: seed,
+            price: seed,
+            ts_ms: now_ms(),
+        }));
+    }
+
+    match run_live_data_activity_quote_stream(instrument_id, tx.clone(), gamma_prob, past_prob).await {
+        Ok(()) => return Ok(()),
+        Err(err) => errors.push(format!("live-data: {err:#}")),
+    }
+
+    let endpoints = market_ws_endpoints();
 
     for endpoint in endpoints {
         match run_market_quote_stream_from_endpoint(instrument_id, &endpoint, tx.clone()).await {
@@ -436,6 +484,399 @@ fn market_ws_endpoints() -> Vec<String> {
         }
     }
     deduped
+}
+fn event_slug_for_subscription() -> String {
+    if let Some(event_slug) = first_non_empty_env("POLYMARKET_EVENT_SLUG") {
+        return event_slug;
+    }
+
+    if let Some(event_url) = first_non_empty_env("POLYMARKET_EVENT_URL") {
+        if let Ok(parsed) = Url::parse(&event_url) {
+            let parts: Vec<&str> = parsed
+                .path_segments()
+                .map(|s| s.collect())
+                .unwrap_or_default();
+            if let Some(idx) = parts.iter().position(|p| *p == "event") {
+                if idx + 1 < parts.len() {
+                    return parts[idx + 1].to_string();
+                }
+            }
+        }
+    }
+
+    auto_today_event_slug()
+}
+
+fn activity_filters_for_subscription() -> String {
+    json!({ "event_slug": event_slug_for_subscription() }).to_string()
+}
+
+fn comments_filters_for_subscription() -> String {
+    let parent_entity_id = std::env::var("POLYMARKET_COMMENTS_PARENT_ENTITY_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10684);
+    let parent_entity_type = first_non_empty_env("POLYMARKET_COMMENTS_PARENT_ENTITY_TYPE")
+        .unwrap_or_else(|| "Series".to_string());
+
+    json!({
+        "parentEntityID": parent_entity_id,
+        "parentEntityType": parent_entity_type
+    })
+    .to_string()
+}
+
+fn parse_slug_epoch_seconds(event_slug: &str) -> Option<i64> {
+    event_slug.rsplit('-').next()?.parse::<i64>().ok()
+}
+
+fn build_past_event_slugs(event_slug: &str, lookback_count: usize) -> Vec<String> {
+    let Some(current_start) = parse_slug_epoch_seconds(event_slug) else {
+        return Vec::new();
+    };
+
+    let prefix = if let Some((p, _)) = event_slug.rsplit_once('-') {
+        p
+    } else {
+        return Vec::new();
+    };
+
+    (1..=lookback_count)
+        .map(|i| format!("{prefix}-{}", current_start - (i as i64 * 300)))
+        .collect()
+}
+
+async fn fetch_past_outcomes_quote(event_slug: &str) -> Result<Quote> {
+    let lookback_count = std::env::var("POLYMARKET_PAST_OUTCOMES_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(120)
+        .clamp(4, 500);
+
+    let past_event_slugs = build_past_event_slugs(event_slug, lookback_count);
+    if past_event_slugs.is_empty() {
+        bail!("unable to derive past event slugs from event_slug={event_slug}");
+    }
+
+    let current_start = parse_slug_epoch_seconds(event_slug)
+        .context("unable to parse current event start from event slug")?;
+    let start_dt = Utc
+        .timestamp_opt(current_start, 0)
+        .single()
+        .context("invalid current event timestamp for past-results request")?;
+    let end_dt = Utc
+        .timestamp_opt(current_start + 300, 0)
+        .single()
+        .context("invalid current event end timestamp for past-results request")?;
+
+    let body = json!({
+        "assetType": "crypto",
+        "symbol": "BTC",
+        "variant": "fiveminute",
+        "count": 4,
+        "currentEventStartTime": start_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "endDate": end_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "includeOutcomesBySlug": true,
+        "outcomesOnly": false,
+        "pastEventSlugs": past_event_slugs
+    });
+
+    let url = "https://polymarket.com/api/past-results";
+    let payload: Value = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .context("past-results request failed")?
+        .error_for_status()
+        .context("past-results request non-success")?
+        .json()
+        .await
+        .context("past-results decode failed")?;
+
+    let outcomes = payload
+        .get("data")
+        .and_then(|d| d.get("results"))
+        .and_then(Value::as_array)
+        .context("past-results payload missing data.results")?;
+
+    if outcomes.is_empty() {
+        bail!("past-results had no rows");
+    }
+
+    let mut up = 0usize;
+    let mut total = 0usize;
+    for row in outcomes {
+        if let Some(outcome) = row.get("outcome").and_then(Value::as_str) {
+            if outcome.eq_ignore_ascii_case("up") {
+                up += 1;
+                total += 1;
+            } else if outcome.eq_ignore_ascii_case("down") {
+                total += 1;
+            }
+        }
+    }
+
+    if total == 0 {
+        bail!("past-results had no usable up/down outcomes");
+    }
+
+    let p_up = (up as f64) / (total as f64);
+
+    Ok(Quote {
+        venue: "polymarket-past-results".to_string(),
+        symbol: event_slug.to_string(),
+        bid: p_up,
+        ask: p_up,
+        price: p_up,
+        ts_ms: now_ms(),
+    })
+}
+async fn fetch_gamma_snapshot_quote(event_slug: &str) -> Result<Quote> {
+    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/markets/slug/{event_slug}");
+
+    let payload: Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma market-by-slug request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma market-by-slug request non-success: {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("gamma market-by-slug decode failed: {url}"))?;
+
+    let bid = payload.get("bestBid").and_then(parse_price)
+        .or_else(|| payload.get("outcomePrices").and_then(Value::as_str).and_then(|s| {
+            serde_json::from_str::<Value>(s).ok().and_then(|v| v.as_array().and_then(|a| a.first().and_then(parse_price)))
+        }))
+        .context("gamma market payload missing bestBid/up outcome price")?;
+
+    let ask = payload.get("bestAsk").and_then(parse_price).unwrap_or(bid);
+    let condition_id = payload
+        .get("conditionId")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| event_slug.to_string());
+
+    Ok(Quote {
+        venue: "polymarket-gamma".to_string(),
+        symbol: condition_id,
+        bid,
+        ask,
+        price: (bid + ask) / 2.0,
+        ts_ms: now_ms(),
+    })
+}
+async fn stream_live_data_activity_quote(instrument_id: &str, gamma_prob: Option<f64>, past_prob: Option<f64>) -> Result<Quote> {
+    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
+    let (mut ws, _) = connect_async(url.as_str())
+        .await
+        .context("failed to connect to polymarket live-data websocket")?;
+
+    let subscribe = json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "activity",
+                "type": "orders_matched",
+                "filters": activity_filters_for_subscription()
+            },
+            {
+                "topic": "comments",
+                "type": "*",
+                "filters": comments_filters_for_subscription()
+            },
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "filters": "{\"symbol\":\"btc/usd\"}"
+            }
+        ]
+    });
+
+    ws.send(Message::Text(subscribe.to_string().into()))
+        .await
+        .context("failed to subscribe to polymarket live-data activity")?;
+
+    let mut chainlink_anchor: Option<f64> = None;
+    let mut chainlink_latest: Option<f64> = None;
+    let debug_ws = ws_debug_enabled();
+
+    loop {
+        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
+
+        let Some(msg) = (match next {
+            Ok(v) => v,
+            Err(_) => {
+                ws.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("failed to send live-data activity keepalive ping")?;
+                continue;
+            }
+        }) else {
+            return Err(anyhow!("polymarket live-data activity websocket ended without quote"));
+        };
+
+        let msg = msg.context("polymarket live-data activity read error")?;
+        match msg {
+            Message::Text(text) => {
+                let payload: Value = serde_json::from_str(&text)
+                    .context("failed to parse polymarket live-data activity message")?;
+
+                if let Some(spot) = parse_chainlink_spot_price(&payload) {
+                    if chainlink_anchor.is_none() {
+                        chainlink_anchor = Some(spot);
+                    }
+                    chainlink_latest = Some(spot);
+                    if debug_ws {
+                        eprintln!("polymarket ws live_btc_price source=crypto_prices_chainlink symbol=btc/usd spot={:.2} anchor={:?}", spot, chainlink_anchor);
+                    }
+                    continue;
+                }
+
+                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id) {
+                    if let Some(p) = blended_probability(Some(q.price), gamma_prob, past_prob) {
+                        q.bid = p;
+                        q.ask = p;
+                        q.price = p;
+                    }
+
+                    if let Some(bias) = chainlink_trend_bias(chainlink_anchor, chainlink_latest) {
+                        let p = (q.price + bias).clamp(0.0, 1.0);
+                        q.bid = p;
+                        q.ask = p;
+                        q.price = p;
+                    }
+
+                    if debug_ws {
+                        eprintln!("polymarket ws quote source=activity+blend market={} prob={:.4} gamma={:?} past={:?} chainlink_anchor={:?} chainlink_latest={:?}", q.symbol, q.price, gamma_prob, past_prob, chainlink_anchor, chainlink_latest);
+                    }
+
+                    return Ok(q);
+                }
+            }
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .context("failed to pong polymarket live-data activity websocket")?;
+            }
+            Message::Close(_) => {
+                return Err(anyhow!("polymarket live-data activity websocket closed"));
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn run_live_data_activity_quote_stream(
+    instrument_id: &str,
+    tx: watch::Sender<Option<Quote>>,
+    gamma_prob: Option<f64>,
+    past_prob: Option<f64>,
+) -> Result<()> {
+    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
+    let (mut ws, _) = connect_async(url.as_str())
+        .await
+        .context("failed to connect to polymarket live-data websocket")?;
+
+    let subscribe = json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "activity",
+                "type": "orders_matched",
+                "filters": activity_filters_for_subscription()
+            },
+            {
+                "topic": "comments",
+                "type": "*",
+                "filters": comments_filters_for_subscription()
+            },
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "filters": "{\"symbol\":\"btc/usd\"}"
+            }
+        ]
+    });
+
+    ws.send(Message::Text(subscribe.to_string().into()))
+        .await
+        .context("failed to subscribe to polymarket live-data streams")?;
+
+    let mut chainlink_anchor: Option<f64> = None;
+    let mut chainlink_latest: Option<f64> = None;
+    let debug_ws = ws_debug_enabled();
+
+    loop {
+        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
+
+        let Some(msg) = (match next {
+            Ok(v) => v,
+            Err(_) => {
+                ws.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("failed to send live-data keepalive ping")?;
+                continue;
+            }
+        }) else {
+            return Err(anyhow!("polymarket live-data websocket ended"));
+        };
+
+        let msg = msg.context("polymarket live-data read error")?;
+        match msg {
+            Message::Text(text) => {
+                let payload: Value = serde_json::from_str(&text)
+                    .context("failed to parse polymarket live-data message")?;
+
+                if let Some(spot) = parse_chainlink_spot_price(&payload) {
+                    if chainlink_anchor.is_none() {
+                        chainlink_anchor = Some(spot);
+                    }
+                    chainlink_latest = Some(spot);
+                    if debug_ws {
+                        eprintln!("polymarket ws live_btc_price source=crypto_prices_chainlink symbol=btc/usd spot={:.2} anchor={:?}", spot, chainlink_anchor);
+                    }
+                    continue;
+                }
+
+                if let Some(mut q) = parse_activity_quote_from_live_data(&payload, instrument_id) {
+                    if let Some(p) = blended_probability(Some(q.price), gamma_prob, past_prob) {
+                        q.bid = p;
+                        q.ask = p;
+                        q.price = p;
+                    }
+
+                    if let Some(bias) = chainlink_trend_bias(chainlink_anchor, chainlink_latest) {
+                        let p = (q.price + bias).clamp(0.0, 1.0);
+                        q.bid = p;
+                        q.ask = p;
+                        q.price = p;
+                    }
+
+                    if debug_ws {
+                        eprintln!("polymarket ws quote source=activity+blend market={} prob={:.4} gamma={:?} past={:?} chainlink_anchor={:?} chainlink_latest={:?}", q.symbol, q.price, gamma_prob, past_prob, chainlink_anchor, chainlink_latest);
+                    }
+
+                    let _ = tx.send(Some(q));
+                    continue;
+                }
+            }
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .context("failed to pong polymarket live-data websocket")?;
+            }
+            Message::Close(_) => return Err(anyhow!("polymarket live-data websocket closed")),
+            _ => {}
+        }
+    }
 }
 pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
     let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
@@ -479,8 +920,11 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
                 let payload: Value = serde_json::from_str(&text)
                     .context("failed to parse polymarket live-data message")?;
                 if let Some(q) = parse_live_data_quote(&payload) {
-                    return Ok(q);
-                }
+                    if debug_ws {
+                        eprintln!("polymarket ws quote source=activity+blend market={} prob={:.4} gamma={:?} past={:?} chainlink_anchor={:?} chainlink_latest={:?}", q.symbol, q.price, gamma_prob, past_prob, chainlink_anchor, chainlink_latest);
+                    }
+
+                    return Ok(q);                }
             }
             Message::Ping(payload) => {
                 ws.send(Message::Pong(payload))
@@ -978,6 +1422,90 @@ fn parse_live_data_quote(payload: &Value) -> Option<Quote> {
     })
 }
 
+fn parse_chainlink_spot_price(payload: &Value) -> Option<f64> {
+    parse_live_data_quote(payload).map(|q| q.price)
+}
+
+fn blended_probability(activity_prob: Option<f64>, gamma_prob: Option<f64>, past_prob: Option<f64>) -> Option<f64> {
+    let mut weighted = 0.0;
+    let mut total_w = 0.0;
+
+    if let Some(p) = activity_prob {
+        weighted += p * 0.70;
+        total_w += 0.70;
+    }
+    if let Some(p) = gamma_prob {
+        weighted += p * 0.15;
+        total_w += 0.15;
+    }
+    if let Some(p) = past_prob {
+        weighted += p * 0.15;
+        total_w += 0.15;
+    }
+
+    if total_w <= 0.0 {
+        return None;
+    }
+    Some((weighted / total_w).clamp(0.0, 1.0))
+}
+
+fn chainlink_trend_bias(anchor: Option<f64>, latest: Option<f64>) -> Option<f64> {
+    let anchor = anchor?;
+    let latest = latest?;
+    if !(anchor.is_finite() && latest.is_finite()) || anchor <= 0.0 {
+        return None;
+    }
+
+    let ret = (latest - anchor) / anchor;
+    Some((ret * 4.0).clamp(-0.03, 0.03))
+}
+fn parse_activity_quote_from_live_data(payload: &Value, instrument_id: &str) -> Option<Quote> {
+    let topic = payload.get("topic").and_then(Value::as_str)?;
+    let msg_type = payload.get("type").and_then(Value::as_str)?;
+    if topic != "activity" || msg_type != "orders_matched" {
+        return None;
+    }
+
+    let item = payload.get("payload")?;
+    let condition_id = item
+        .get("conditionId")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("condition_id").and_then(Value::as_str))?;
+    let asset = item
+        .get("asset")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("asset_id").and_then(Value::as_str))?;
+    let raw_price = item.get("price").and_then(parse_price)?;
+
+    if instrument_id.starts_with("0x") {
+        if !condition_id.eq_ignore_ascii_case(instrument_id) {
+            return None;
+        }
+    } else if asset != instrument_id {
+        return None;
+    }
+
+    let outcome_index = item.get("outcomeIndex").and_then(Value::as_i64);
+    let outcome = item.get("outcome").and_then(Value::as_str);
+
+    let up_probability = match (outcome_index, outcome) {
+        (Some(0), _) => raw_price,
+        (Some(1), _) => 1.0 - raw_price,
+        (_, Some(label)) if label.eq_ignore_ascii_case("up") => raw_price,
+        (_, Some(label)) if label.eq_ignore_ascii_case("down") => 1.0 - raw_price,
+        _ => raw_price,
+    }
+    .clamp(0.0, 1.0);
+
+    Some(Quote {
+        venue: "polymarket-live-data".to_string(),
+        symbol: condition_id.to_string(),
+        bid: up_probability,
+        ask: up_probability,
+        price: up_probability,
+        ts_ms: parse_timestamp_ms(payload.get("timestamp")),
+    })
+}
 fn parse_price(v: &Value) -> Option<f64> {
     match v {
         Value::String(s) => s.parse::<f64>().ok(),
