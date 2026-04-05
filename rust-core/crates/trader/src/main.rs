@@ -287,7 +287,7 @@ async fn run_iteration(
 
     if env_bool("TRADER_DEBUG_QUOTES", false) {
         eprintln!(
-            "engine quotes pm={venue:{} symbol:{} price:{:.4} ts_ms:{}} bn={venue:{} symbol:{} price:{:.2} ts_ms:{}}",
+            "engine quotes pm={{venue:{} symbol:{} price:{:.4} ts_ms:{}}} bn={{venue:{} symbol:{} price:{:.2} ts_ms:{}}}",
             pm_quote.venue,
             pm_quote.symbol,
             pm_quote.price,
