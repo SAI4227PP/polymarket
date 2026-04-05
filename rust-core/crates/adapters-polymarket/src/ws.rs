@@ -76,9 +76,10 @@ pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
         .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());
 
-    stream_market_quote_from_endpoint(instrument_id, &market_ws_url)
-        .await
-        .or_else(|_| stream_market_quote_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND))
+    match stream_market_quote_from_endpoint(instrument_id, &market_ws_url).await {
+        Ok(q) => Ok(q),
+        Err(_) => stream_market_quote_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND).await,
+    }
 }
 
 pub async fn run_market_quote_stream(
@@ -88,9 +89,12 @@ pub async fn run_market_quote_stream(
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
         .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());
 
-    run_market_quote_stream_from_endpoint(instrument_id, &market_ws_url, tx.clone())
-        .await
-        .or_else(|_| run_market_quote_stream_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND, tx))
+    match run_market_quote_stream_from_endpoint(instrument_id, &market_ws_url, tx.clone()).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            run_market_quote_stream_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND, tx).await
+        }
+    }
 }
 
 pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
@@ -117,7 +121,7 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
 
-        let Some(msg) = match next {
+        let Some(msg) = (match next {
             Ok(v) => v,
             Err(_) => {
                 ws.send(Message::Ping(Vec::new().into()))
@@ -125,7 +129,7 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
                     .context("failed to send live-data keepalive ping")?;
                 continue;
             }
-        } else {
+        }) else {
             return Err(anyhow!("polymarket live-data websocket ended without quote"));
         };
 
@@ -167,7 +171,7 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
 
-        let Some(msg) = match next {
+        let Some(msg) = (match next {
             Ok(v) => v,
             Err(_) => {
                 ws.send(Message::Ping(Vec::new().into()))
@@ -175,7 +179,7 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
                     .context("failed to send market keepalive ping")?;
                 continue;
             }
-        } else {
+        }) else {
             return Err(anyhow!("polymarket market websocket ended without quote"));
         };
 
@@ -229,7 +233,7 @@ async fn run_market_quote_stream_from_endpoint(
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
 
-        let Some(msg) = match next {
+        let Some(msg) = (match next {
             Ok(v) => v,
             Err(_) => {
                 ws.send(Message::Ping(Vec::new().into()))
@@ -237,7 +241,7 @@ async fn run_market_quote_stream_from_endpoint(
                     .context("failed to send market keepalive ping")?;
                 continue;
             }
-        } else {
+        }) else {
             return Err(anyhow!("polymarket market websocket ended"));
         };
 
