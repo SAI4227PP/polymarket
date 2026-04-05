@@ -79,9 +79,9 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
     net_edge_bps -= spread_penalty + age_penalty + vol_penalty;
 
     let direction = if gross_edge_bps_signed > 0.0 {
-        TradeDirection::BuyPolymarketSellBinance
+        TradeDirection::Up
     } else if gross_edge_bps_signed < 0.0 {
-        TradeDirection::SellPolymarketBuyBinance
+        TradeDirection::Down
     } else {
         TradeDirection::Flat
     };
@@ -107,3 +107,4 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+

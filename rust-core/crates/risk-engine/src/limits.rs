@@ -50,6 +50,19 @@ pub fn evaluate_trade(input: RiskInput, limits: RiskLimits) -> RiskDecision {
         violations.push("invalid realized volatility".to_string());
     }
 
+    if !limits.max_notional_usd.is_finite() || limits.max_notional_usd <= 0.0 {
+        violations.push("invalid risk limit: max_notional_usd".to_string());
+    }
+    if !limits.max_daily_loss_usd.is_finite() || limits.max_daily_loss_usd <= 0.0 {
+        violations.push("invalid risk limit: max_daily_loss_usd".to_string());
+    }
+    if !limits.max_leverage.is_finite() || limits.max_leverage <= 0.0 {
+        violations.push("invalid risk limit: max_leverage".to_string());
+    }
+    if !limits.max_var_budget_usd.is_finite() || limits.max_var_budget_usd <= 0.0 {
+        violations.push("invalid risk limit: max_var_budget_usd".to_string());
+    }
+
     if input.notional_usd > limits.max_notional_usd {
         violations.push("notional limit exceeded".to_string());
     }
@@ -70,12 +83,19 @@ pub fn evaluate_trade(input: RiskInput, limits: RiskLimits) -> RiskDecision {
         violations.push("var budget exceeded".to_string());
     }
 
+    let projected_open_positions = input.open_positions.saturating_add(1);
+    let max_concentration_ratio = if projected_open_positions <= 1 {
+        1.0
+    } else {
+        limits.max_concentration_ratio.clamp(0.0, 1.0)
+    };
+
     let concentration = if input.gross_exposure_usd > 0.0 {
         (input.largest_position_usd.abs() / input.gross_exposure_usd.abs()).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    if concentration > limits.max_concentration_ratio {
+    if concentration > max_concentration_ratio {
         violations.push("concentration limit exceeded".to_string());
     }
 
@@ -90,3 +110,53 @@ pub fn evaluate_trade(input: RiskInput, limits: RiskLimits) -> RiskDecision {
         violations,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{evaluate_trade, RiskInput, RiskLimits};
+
+    fn base_input() -> RiskInput {
+        RiskInput {
+            notional_usd: 1.0,
+            day_pnl_usd: 0.0,
+            open_positions: 0,
+            gross_exposure_usd: 1.0,
+            account_equity_usd: 100.0,
+            realized_vol_bps: 20.0,
+            largest_position_usd: 1.0,
+        }
+    }
+
+    #[test]
+    fn allows_single_position_full_concentration() {
+        let input = base_input();
+        let limits = RiskLimits {
+            max_concentration_ratio: 0.5,
+            ..RiskLimits::default()
+        };
+
+        let out = evaluate_trade(input, limits);
+        assert!(out.allowed, "{out:?}");
+    }
+
+    #[test]
+    fn rejects_concentration_after_first_position() {
+        let mut input = base_input();
+        input.open_positions = 1;
+        input.gross_exposure_usd = 2.0;
+        input.largest_position_usd = 1.5;
+
+        let limits = RiskLimits {
+            max_concentration_ratio: 0.5,
+            ..RiskLimits::default()
+        };
+
+        let out = evaluate_trade(input, limits);
+        assert!(!out.allowed);
+        assert!(out
+            .violations
+            .iter()
+            .any(|v| v.contains("concentration limit")));
+    }
+}
+

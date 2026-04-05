@@ -9,9 +9,11 @@ adapters-binance = { path = "../adapters-binance" }
 strategy-engine = { path = "../strategy-engine" }
 risk-engine = { path = "../risk-engine" }
 execution-engine = { path = "../execution-engine" }
+portfolio-engine = { path = "../portfolio-engine" }
 common = { path = "../common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 redis = { version = "0.25", features = ["tokio-comp"] }
+

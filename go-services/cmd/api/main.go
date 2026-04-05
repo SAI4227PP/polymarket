@@ -34,12 +34,18 @@ type traderState struct {
 	ExecutionStatus string  `json:"execution_status"`
 	OpenPositions   int     `json:"open_positions"`
 	DayPnlUSD       float64 `json:"day_pnl_usd"`
+	PortfolioNetQty        float64 `json:"portfolio_net_qty"`
+	PortfolioAvgEntry      float64 `json:"portfolio_avg_entry"`
+	PortfolioUnrealizedPnL float64 `json:"portfolio_unrealized_pnl_usd"`
+	PortfolioTotalPnL      float64 `json:"portfolio_total_pnl_usd"`
 }
 
 type completedTrade struct {
 	ID               string  `json:"id"`
 	Pair             string  `json:"pair"`
 	Direction        string  `json:"direction"`
+	EntrySide        string  `json:"entry_side"`
+	ExitSide         string  `json:"exit_side"`
 	Quantity         float64 `json:"quantity"`
 	EntryPrice       float64 `json:"entry_price"`
 	ExitPrice        float64 `json:"exit_price"`
@@ -269,6 +275,10 @@ func main() {
 				execSection["execution_status"] = state.ExecutionStatus
 				execSection["open_positions"] = state.OpenPositions
 				execSection["day_pnl_usd"] = state.DayPnlUSD
+				execSection["portfolio_net_qty"] = state.PortfolioNetQty
+				execSection["portfolio_avg_entry"] = state.PortfolioAvgEntry
+				execSection["portfolio_unrealized_pnl_usd"] = state.PortfolioUnrealizedPnL
+				execSection["portfolio_total_pnl_usd"] = state.PortfolioTotalPnL
 			} else {
 				marketSection["warning"] = "trader state unavailable in redis"
 				signalSection["warning"] = stateErr.Error()

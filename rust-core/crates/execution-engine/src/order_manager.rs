@@ -60,7 +60,7 @@ pub fn build_order_intent(
         cfg.slippage_model,
     );
 
-    let is_buy = signal.direction == TradeDirection::BuyPolymarketSellBinance;
+    let is_buy = signal.direction == TradeDirection::Up;
     let limit_price = apply_slippage(ref_price, slippage_bps, is_buy);
     if limit_price <= 0.0 {
         return None;
@@ -114,3 +114,4 @@ pub fn size_from_edge_bps(net_edge_bps: f64, base_qty: f64, threshold_bps: f64) 
     let score = (net_edge_bps / threshold_bps).clamp(0.0, 3.0);
     base_qty * (0.25 + 0.25 * score)
 }
+

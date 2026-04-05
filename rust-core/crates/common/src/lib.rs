@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeDirection {
-    BuyPolymarketSellBinance,
-    SellPolymarketBuyBinance,
+    Up,
+    Down,
     Flat,
 }
 
@@ -53,3 +53,4 @@ pub struct ExecutionReport {
     pub status: String,
     pub routed_path: String,
 }
+
