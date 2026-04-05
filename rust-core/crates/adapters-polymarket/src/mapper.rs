@@ -1,3 +1,3 @@
-pub fn map_market_to_symbol(market_id: &str) -> String {
-    format!("PM-{}", market_id)
+pub fn map_market_to_symbol(asset_id: &str) -> String {
+    asset_id.trim().to_string()
 }

@@ -41,12 +41,17 @@ pub async fn stream_best_bid_ask(symbol: &str) -> Result<Quote> {
                     .best_ask
                     .parse::<f64>()
                     .context("invalid binance best ask")?;
-                let price = (bid + ask) / 2.0;
+
+                if !(bid.is_finite() && ask.is_finite()) || ask < bid {
+                    continue;
+                }
 
                 return Ok(Quote {
                     venue: "binance".to_string(),
                     symbol: payload.symbol,
-                    price,
+                    bid,
+                    ask,
+                    price: (bid + ask) / 2.0,
                     ts_ms: payload.event_time_ms.unwrap_or_else(now_ms),
                 });
             }

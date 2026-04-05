@@ -1,3 +1,7 @@
 pub fn normalize_symbol(symbol: &str) -> String {
-    symbol.to_lowercase()
+    symbol
+        .trim()
+        .replace('-', "")
+        .replace('_', "")
+        .to_lowercase()
 }

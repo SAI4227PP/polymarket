@@ -6,13 +6,14 @@ Hybrid architecture:
 
 ## Quick Start
 1. Copy `.env.example` to `.env` and fill keys.
-2. Update `config/markets.yaml` with your Polymarket BTC market id.
+2. Set `POLYMARKET_ASSET_ID` for the BTC market token id.
 3. Run Rust trader (paper mode):
    - `cd rust-core`
    - `cargo run -p trader`
-4. Run Go dry run service:
-   - `cd go-services`
-   - `go run ./cmd/dry-run`
+
+The Rust trader now connects to:
+- Binance WS: `wss://stream.binance.com:9443/ws/<symbol>@bookTicker`
+- Polymarket WS: `wss://ws-subscriptions-clob.polymarket.com/ws/market`
 
 ## Status
-This scaffold is production-oriented structure with starter code and placeholders.
+This scaffold includes real websocket quote ingestion and placeholder execution/risk logic.
