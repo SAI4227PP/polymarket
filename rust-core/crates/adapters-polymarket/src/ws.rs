@@ -382,30 +382,61 @@ fn month_name(month: u32) -> &'static str {
     }
 }
 pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
-    let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
-        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_FRONTEND.to_string());
+    let endpoints = market_ws_endpoints();
+    let mut errors = Vec::new();
 
-    match stream_market_quote_from_endpoint(instrument_id, &market_ws_url).await {
-        Ok(q) => Ok(q),
-        Err(_) => stream_market_quote_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND).await,
+    for endpoint in endpoints {
+        match stream_market_quote_from_endpoint(instrument_id, &endpoint).await {
+            Ok(q) => return Ok(q),
+            Err(err) => errors.push(format!("{endpoint}: {err:#}")),
+        }
     }
+
+    bail!(
+        "all polymarket market websocket endpoints failed: {}",
+        errors.join(" | ")
+    );
 }
 
 pub async fn run_market_quote_stream(
     instrument_id: &str,
     tx: watch::Sender<Option<Quote>>,
 ) -> Result<()> {
-    let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
-        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_FRONTEND.to_string());
+    let endpoints = market_ws_endpoints();
+    let mut errors = Vec::new();
 
-    match run_market_quote_stream_from_endpoint(instrument_id, &market_ws_url, tx.clone()).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            run_market_quote_stream_from_endpoint(instrument_id, POLYMARKET_WS_MARKET_FRONTEND, tx).await
+    for endpoint in endpoints {
+        match run_market_quote_stream_from_endpoint(instrument_id, &endpoint, tx.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(err) => errors.push(format!("{endpoint}: {err:#}")),
         }
     }
+
+    bail!(
+        "all polymarket market websocket endpoints failed: {}",
+        errors.join(" | ")
+    );
 }
 
+fn market_ws_endpoints() -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Some(configured) = first_non_empty_env("POLYMARKET_MARKET_WS_URL") {
+        out.push(configured);
+    }
+
+    // Prefer canonical CLOB endpoint, but keep frontend endpoint as a fallback.
+    out.push(POLYMARKET_WS_MARKET_CLOB.to_string());
+    out.push(POLYMARKET_WS_MARKET_FRONTEND.to_string());
+
+    let mut deduped = Vec::new();
+    for endpoint in out {
+        if !deduped.iter().any(|existing| existing == &endpoint) {
+            deduped.push(endpoint);
+        }
+    }
+    deduped
+}
 pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
     let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
     let (mut ws, _) = connect_async(url.as_str())
