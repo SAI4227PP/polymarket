@@ -27,12 +27,13 @@ struct MarketSubscription {
 }
 
 impl MarketSubscription {
-    fn from_instrument_id(instrument_id: &str) -> Result<Self> {
+    async fn from_instrument_id(instrument_id: &str) -> Result<Self> {
         if instrument_id.starts_with("0x") {
-            let asset_ids = resolve_market_asset_ids()
-                .context("missing POLYMARKET_OUTCOME_ASSET_IDS for market-id subscription")?;
+            let asset_ids = resolve_market_asset_ids(instrument_id)
+                .await
+                .context("failed resolving market asset ids for market-id subscription")?;
             if asset_ids.is_empty() {
-                bail!("POLYMARKET_OUTCOME_ASSET_IDS must include at least one asset id");
+                bail!("resolved market asset ids are empty");
             }
             return Ok(Self {
                 mode: InstrumentMode::Market,
@@ -154,7 +155,7 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
 }
 
 async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) -> Result<Quote> {
-    let subscription = MarketSubscription::from_instrument_id(instrument_id)?;
+    let subscription = MarketSubscription::from_instrument_id(instrument_id).await?;
 
     let url = Url::parse(endpoint).context("invalid polymarket market websocket url")?;
     let (mut ws, _) = connect_async(url.as_str())
@@ -194,9 +195,6 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
                     &subscription,
                     preferred_asset.as_deref(),
                 ) {
-                    if preferred_asset.is_none() {
-                        preferred_asset = Some(quote.symbol.clone());
-                    }
                     return Ok(quote);
                 }
             }
@@ -216,7 +214,7 @@ async fn run_market_quote_stream_from_endpoint(
     endpoint: &str,
     tx: watch::Sender<Option<Quote>>,
 ) -> Result<()> {
-    let subscription = MarketSubscription::from_instrument_id(instrument_id)?;
+    let subscription = MarketSubscription::from_instrument_id(instrument_id).await?;
 
     let url = Url::parse(endpoint).context("invalid polymarket market websocket url")?;
     let (mut ws, _) = connect_async(url.as_str())
@@ -273,9 +271,11 @@ async fn run_market_quote_stream_from_endpoint(
     }
 }
 
-fn resolve_market_asset_ids() -> Result<Vec<String>> {
-    let raw = std::env::var("POLYMARKET_OUTCOME_ASSET_IDS")
-        .context("POLYMARKET_OUTCOME_ASSET_IDS is required when using POLYMARKET_MARKET_ID")?;
+fn parse_market_asset_ids_from_env() -> Vec<String> {
+    let raw = match std::env::var("POLYMARKET_OUTCOME_ASSET_IDS") {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
 
     let mut out = Vec::new();
     for token in raw.split(',') {
@@ -284,8 +284,102 @@ fn resolve_market_asset_ids() -> Result<Vec<String>> {
             out.push(v.to_string());
         }
     }
+    out
+}
 
-    Ok(out)
+async fn resolve_market_asset_ids(market_id: &str) -> Result<Vec<String>> {
+    let env_ids = parse_market_asset_ids_from_env();
+    if !env_ids.is_empty() {
+        return Ok(env_ids);
+    }
+
+    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+    let base = base.trim_end_matches('/');
+    let client = reqwest::Client::new();
+
+    let by_path = format!("{base}/markets/{market_id}");
+    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_path).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+    let by_query = format!("{base}/markets?id={market_id}");
+    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_query).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+    bail!("could not resolve market asset ids for market_id={market_id}");
+}
+
+async fn fetch_market_asset_ids_from_gamma(client: &reqwest::Client, url: &str) -> Result<Vec<String>> {
+    let resp = client
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma request failed: {url}"))?;
+
+    if !resp.status().is_success() {
+        bail!("gamma request non-success status {} for {}", resp.status(), url);
+    }
+
+    let payload: Value = resp
+        .json()
+        .await
+        .with_context(|| format!("gamma response json decode failed: {url}"))?;
+
+    let ids = parse_market_asset_ids_from_gamma_payload(&payload);
+    if ids.is_empty() {
+        bail!("gamma response had no market asset ids");
+    }
+    Ok(ids)
+}
+
+fn parse_market_asset_ids_from_gamma_payload(payload: &Value) -> Vec<String> {
+    match payload {
+        Value::Object(_) => parse_market_asset_ids_from_gamma_market(payload),
+        Value::Array(items) => items
+            .iter()
+            .find_map(|v| {
+                let ids = parse_market_asset_ids_from_gamma_market(v);
+                if ids.is_empty() { None } else { Some(ids) }
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_market_asset_ids_from_gamma_market(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(arr) = v.get("clobTokenIds").and_then(Value::as_array) {
+        for idv in arr {
+            if let Some(id) = idv.as_str() {
+                let id = id.trim();
+                if !id.is_empty() && !out.iter().any(|e| e == id) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        return out;
+    }
+
+    if let Some(s) = v.get("clobTokenIds").and_then(Value::as_str) {
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
+            for idv in arr {
+                if let Some(id) = idv.as_str() {
+                    let id = id.trim();
+                    if !id.is_empty() && !out.iter().any(|e| e == id) {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn parse_quote_from_payload(
