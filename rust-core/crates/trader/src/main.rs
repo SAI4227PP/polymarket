@@ -60,14 +60,6 @@ struct TraderState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let resolved_pm = polymarket_ws::resolve_instrument_from_env()
-        .await
-        .context("failed to resolve Polymarket instrument (env IDs, event URL/slug, or auto-today fallback)")?;
-    let pm_instrument_id = resolved_pm.instrument_id.clone();
-    println!(
-        "trader bootstrap: polymarket instrument={} source={}",
-        pm_instrument_id, resolved_pm.source
-    );
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
 
     let loop_ms = env_u64("LOOP_INTERVAL_MS", 1_000);
@@ -125,7 +117,7 @@ async fn main() -> Result<()> {
     let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
 
     spawn_binance_stream(bn_symbol.clone(), bn_tx);
-    spawn_polymarket_stream(pm_instrument_id.clone(), pm_tx);
+    spawn_polymarket_stream(pm_tx);
 
     let mut redis_conn: Option<MultiplexedConnection> = None;
 
@@ -467,15 +459,88 @@ fn spawn_binance_stream(symbol: String, tx: watch::Sender<Option<Quote>>) {
     });
 }
 
-fn spawn_polymarket_stream(instrument_id: String, tx: watch::Sender<Option<Quote>>) {
+fn spawn_polymarket_stream(tx: watch::Sender<Option<Quote>>) {
     tokio::spawn(async move {
+        let mut last_instrument: Option<String> = None;
+        let mut last_source: Option<String> = None;
+
         loop {
-            if let Err(err) = polymarket_ws::run_market_quote_stream(&instrument_id, tx.clone()).await {
-                eprintln!("polymarket stream error: {err:#}");
+            let resolved = match polymarket_ws::resolve_instrument_from_env().await {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("polymarket resolve error: {err:#}");
+                    sleep(Duration::from_millis(1000)).await;
+                    continue;
+                }
+            };
+
+            let instrument_id = resolved.instrument_id;
+            let source = resolved.source;
+
+            if last_instrument.as_deref() != Some(instrument_id.as_str()) {
+                if let (Some(prev_market), Some(prev_source)) = (last_instrument.as_ref(), last_source.as_ref()) {
+                    let prev_bucket = extract_5m_bucket(prev_source).or_else(|| extract_5m_bucket(prev_market));
+                    let new_bucket = extract_5m_bucket(&source).or_else(|| extract_5m_bucket(&instrument_id));
+                    eprintln!(
+                        "polymarket 5m transition resolved_previous_bucket={:?} previous_market={} -> new_bucket={:?} new_market={}",
+                        prev_bucket, prev_market, new_bucket, instrument_id
+                    );
+                }
+
+                eprintln!(
+                    "polymarket rollover subscribe instrument={} source={}",
+                    instrument_id, source
+                );
+                last_instrument = Some(instrument_id.clone());
+                last_source = Some(source.clone());
             }
-            sleep(Duration::from_millis(750)).await;
+
+            let tx_clone = tx.clone();
+            let instrument_for_task = instrument_id.clone();
+            let mut stream_task = tokio::spawn(async move {
+                polymarket_ws::run_market_quote_stream(&instrument_for_task, tx_clone).await
+            });
+
+            let rollover_wait = next_polymarket_rollover_wait();
+            tokio::pin!(rollover_wait);
+
+            tokio::select! {
+                task_res = &mut stream_task => {
+                    match task_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => eprintln!("polymarket stream error: {err:#}"),
+                        Err(err) => eprintln!("polymarket stream task join error: {err}"),
+                    }
+                }
+                _ = &mut rollover_wait => {
+                    eprintln!("polymarket rollover boundary reached; re-resolving market");
+                    stream_task.abort();
+                    let _ = stream_task.await;
+                }
+            }
+
+            sleep(Duration::from_millis(500)).await;
         }
     });
+}
+
+fn extract_5m_bucket(value: &str) -> Option<i64> {
+    let token = value.split('-').next_back()?.trim();
+    token.parse::<i64>().ok()
+}
+
+async fn next_polymarket_rollover_wait() {
+    let mode = std::env::var("POLYMARKET_AUTO_EVENT_MODE").unwrap_or_default();
+    if mode.eq_ignore_ascii_case("epoch_5m") {
+        let now_ms = now_ms();
+        let period_ms = 300_000_u64;
+        let next_boundary_ms = ((now_ms / period_ms) + 1) * period_ms + 1200;
+        let wait_ms = next_boundary_ms.saturating_sub(now_ms).max(500);
+        sleep(Duration::from_millis(wait_ms)).await;
+        return;
+    }
+
+    sleep(Duration::from_secs(300)).await;
 }
 
 fn settle_expired_positions(

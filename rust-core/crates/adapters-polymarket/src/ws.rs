@@ -126,7 +126,7 @@ pub async fn resolve_instrument_from_env() -> Result<ResolvedInstrument> {
                 });
             }
         }
-        bail!("POLYMARKET_EVENT_URL must look like /event/{event-slug}[/market-slug]");
+        bail!("POLYMARKET_EVENT_URL must look like /event/{{event-slug}}[/market-slug]");
     }
 
     if let Some(event_slug) = first_non_empty_env("POLYMARKET_EVENT_SLUG") {
@@ -463,7 +463,7 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
         .await
         .context("failed to send polymarket market subscription")?;
 
-    let mut preferred_asset: Option<String> = None;
+    let preferred_asset: Option<String> = None;
 
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
@@ -522,7 +522,7 @@ async fn run_market_quote_stream_from_endpoint(
         .await
         .context("failed to send polymarket market subscription")?;
 
-    let mut preferred_asset: Option<String> = None;
+    let preferred_asset: Option<String> = None;
 
     loop {
         let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
@@ -958,4 +958,5 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
 
