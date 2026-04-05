@@ -96,10 +96,6 @@ impl MarketSubscription {
             payload["assets_ids"] = json!(self.asset_ids);
         }
 
-        if let Some(market_id) = &self.market_id {
-            payload["markets"] = json!([market_id]);
-        }
-
         payload
     }
 
@@ -135,6 +131,13 @@ fn ws_debug_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn parse_ws_json_text(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok()
+}
 #[derive(Debug, Clone)]
 pub struct ResolvedInstrument {
     pub instrument_id: String,
@@ -330,8 +333,9 @@ async fn resolve_market_id_from_activity_ws(event_slug: &str) -> Result<String> 
         let msg = msg.context("activity websocket read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value =
-                    serde_json::from_str(&text).context("failed to parse activity message")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
                 if let Some(mid) = parse_condition_id_from_activity_message(&payload, event_slug) {
                     return Ok(mid);
                 }
@@ -764,8 +768,9 @@ async fn stream_live_data_activity_quote(instrument_id: &str, gamma_prob: Option
         let msg = msg.context("polymarket live-data activity read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value = serde_json::from_str(&text)
-                    .context("failed to parse polymarket live-data activity message")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
 
                 if let Some(spot) = parse_chainlink_spot_price(&payload) {
                     if chainlink_anchor.is_none() {
@@ -872,8 +877,9 @@ async fn run_live_data_activity_quote_stream(
         let msg = msg.context("polymarket live-data read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value = serde_json::from_str(&text)
-                    .context("failed to parse polymarket live-data message")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
 
                 if let Some(spot) = parse_chainlink_spot_price(&payload) {
                     if chainlink_anchor.is_none() {
@@ -957,8 +963,9 @@ pub async fn stream_chainlink_btc_reference() -> Result<Quote> {
         let msg = msg.context("polymarket live-data read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value = serde_json::from_str(&text)
-                    .context("failed to parse polymarket live-data message")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
                 if let Some(q) = parse_live_data_quote(&payload) {
                     return Ok(q);
                 }
@@ -1007,8 +1014,9 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
         let msg = msg.context("polymarket market websocket read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value =
-                    serde_json::from_str(&text).context("failed to parse polymarket market payload")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
 
                 if let Some(quote) = parse_quote_from_payload(
                     &payload,
@@ -1066,8 +1074,9 @@ async fn run_market_quote_stream_from_endpoint(
         let msg = msg.context("polymarket market websocket read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value =
-                    serde_json::from_str(&text).context("failed to parse polymarket market payload")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
 
                 if let Some(quote) = parse_quote_from_payload(
                     &payload,
@@ -1198,8 +1207,9 @@ async fn resolve_market_asset_ids_from_activity_ws(condition_id: &str) -> Result
         let msg = msg.context("live-data activity stream read error")?;
         match msg {
             Message::Text(text) => {
-                let payload: Value = serde_json::from_str(&text)
-                    .context("failed to parse live-data activity stream message")?;
+                let Some(payload) = parse_ws_json_text(&text) else {
+                    continue;
+                };
                 let topic = payload.get("topic").and_then(Value::as_str);
                 let ty = payload.get("type").and_then(Value::as_str);
                 if topic != Some("activity") || ty != Some("orders_matched") {
