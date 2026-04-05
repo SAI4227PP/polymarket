@@ -9,9 +9,11 @@ WORKDIR /workspace/rust-core
 RUN cargo build --release -p trader
 
 FROM debian:bookworm-slim
-RUN useradd -m -u 10001 trader
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 10001 trader
 WORKDIR /app
 COPY --from=builder /workspace/rust-core/target/release/trader /app/trader
 USER trader
 ENTRYPOINT ["/app/trader"]
-
