@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{Datelike, Utc};
 use common::Quote;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -115,10 +116,29 @@ pub async fn resolve_instrument_id_from_env() -> Result<String> {
         return resolve_market_id_from_event_slug(&event_slug, None).await;
     }
 
-    bail!("missing non-empty POLYMARKET_ASSET_ID or POLYMARKET_MARKET_ID or POLYMARKET_EVENT_URL or POLYMARKET_EVENT_SLUG");
+    let auto_event_slug = auto_today_event_slug();
+    resolve_market_id_from_event_slug(&auto_event_slug, None)
+        .await
+        .with_context(|| format!("auto-resolve failed for event slug {auto_event_slug}"))
 }
 
-async fn resolve_market_id_from_event_slug(event_slug: &str, preferred_market_slug: Option<&str>) -> Result<String> {
+async fn resolve_market_id_from_event_slug(
+    event_slug: &str,
+    preferred_market_slug: Option<&str>,
+) -> Result<String> {
+    match resolve_market_id_from_gamma_event(event_slug, preferred_market_slug).await {
+        Ok(id) => Ok(id),
+        Err(gamma_err) => resolve_market_id_from_activity_ws(event_slug)
+            .await
+            .with_context(|| {
+                format!(
+                    "gamma lookup failed ({gamma_err:#}); activity websocket fallback failed for event_slug={event_slug}"
+                )
+            }),
+    }
+}
+
+async fn resolve_market_id_from_gamma_event(event_slug: &str, preferred_market_slug: Option<&str>) -> Result<String> {
     let base = std::env::var("POLYMARKET_GAMMA_API_URL")
         .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
     let base = base.trim_end_matches('/');
@@ -179,6 +199,129 @@ async fn resolve_market_id_from_event_slug(event_slug: &str, preferred_market_sl
     bail!("resolved market is missing a usable 0x market identifier");
 }
 
+
+async fn resolve_market_id_from_activity_ws(event_slug: &str) -> Result<String> {
+    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
+    let (mut ws, _) = connect_async(url.as_str())
+        .await
+        .context("failed to connect to polymarket live-data websocket")?;
+
+    let filters = serde_json::to_string(&json!({ "event_slug": event_slug }))
+        .context("failed to encode activity filters")?;
+    let subscribe = json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "activity",
+                "type": "orders_matched",
+                "filters": filters
+            }
+        ]
+    });
+
+    ws.send(Message::Text(subscribe.to_string().into()))
+        .await
+        .context("failed to subscribe activity websocket")?;
+
+    let deadline = Duration::from_secs(25);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > deadline {
+            bail!("timed out waiting for activity stream conditionId");
+        }
+
+        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
+        let Some(msg) = (match next {
+            Ok(v) => v,
+            Err(_) => {
+                ws.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("failed to send activity keepalive ping")?;
+                continue;
+            }
+        }) else {
+            bail!("activity websocket ended before market id could be resolved");
+        };
+
+        let msg = msg.context("activity websocket read error")?;
+        match msg {
+            Message::Text(text) => {
+                let payload: Value =
+                    serde_json::from_str(&text).context("failed to parse activity message")?;
+                if let Some(mid) = parse_condition_id_from_activity_message(&payload, event_slug) {
+                    return Ok(mid);
+                }
+            }
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .context("failed to pong activity websocket")?;
+            }
+            Message::Close(_) => bail!("activity websocket closed"),
+            _ => {}
+        }
+    }
+}
+
+fn parse_condition_id_from_activity_message(payload: &Value, event_slug: &str) -> Option<String> {
+    let topic = payload.get("topic").and_then(Value::as_str)?;
+    if topic != "activity" {
+        return None;
+    }
+
+    let msg_type = payload.get("type").and_then(Value::as_str)?;
+    if msg_type != "orders_matched" {
+        return None;
+    }
+
+    let item = payload.get("payload")?;
+    let msg_event_slug = item
+        .get("eventSlug")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("event_slug").and_then(Value::as_str));
+
+    if msg_event_slug != Some(event_slug) {
+        return None;
+    }
+
+    let candidate = item
+        .get("conditionId")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("condition_id").and_then(Value::as_str))?;
+
+    let trimmed = candidate.trim();
+    if trimmed.starts_with("0x") && !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+
+    None
+}
+
+fn auto_today_event_slug() -> String {
+    let prefix = first_non_empty_env("POLYMARKET_AUTO_EVENT_PREFIX")
+        .unwrap_or_else(|| "bitcoin-above-on".to_string());
+    let now = Utc::now().date_naive();
+    format!("{}-{}-{}", prefix, month_name(now.month()), now.day())
+}
+
+fn month_name(month: u32) -> &'static str {
+    match month {
+        1 => "january",
+        2 => "february",
+        3 => "march",
+        4 => "april",
+        5 => "may",
+        6 => "june",
+        7 => "july",
+        8 => "august",
+        9 => "september",
+        10 => "october",
+        11 => "november",
+        12 => "december",
+        _ => "unknown",
+    }
+}
 pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
         .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());

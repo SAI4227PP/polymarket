@@ -62,7 +62,7 @@ struct TraderState {
 async fn main() -> Result<()> {
     let pm_instrument_id = polymarket_ws::resolve_instrument_id_from_env()
         .await
-        .context("missing non-empty POLYMARKET_ASSET_ID/POLYMARKET_MARKET_ID or resolvable POLYMARKET_EVENT_URL/POLYMARKET_EVENT_SLUG")?;
+        .context("failed to resolve Polymarket instrument (env IDs, event URL/slug, or auto-today fallback)")?;
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
 
     let loop_ms = env_u64("LOOP_INTERVAL_MS", 1_000);
