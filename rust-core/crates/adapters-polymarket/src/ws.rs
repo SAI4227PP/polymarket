@@ -51,18 +51,30 @@ impl MarketSubscription {
     }
 
     fn subscribe_payload(&self) -> Value {
-        json!({
-            "assets_ids": self.asset_ids,
+        let mut payload = json!({
             "type": "market",
             "custom_feature_enabled": true
-        })
+        });
+
+        if !self.asset_ids.is_empty() {
+            payload["assets_ids"] = json!(self.asset_ids);
+        }
+
+        if let Some(market_id) = &self.market_id {
+            payload["markets"] = json!([market_id]);
+        }
+
+        payload
     }
 
     fn accepts_asset(&self, asset_id: &str, preferred_asset: Option<&str>) -> bool {
         if let Some(preferred) = preferred_asset {
             return asset_id == preferred;
         }
-        self.asset_ids.iter().any(|a| a == asset_id)
+        match self.mode {
+            InstrumentMode::Asset => self.asset_ids.iter().any(|a| a == asset_id),
+            InstrumentMode::Market => true,
+        }
     }
 
     fn accepts_market(&self, market_id: Option<&str>) -> bool {
@@ -877,7 +889,7 @@ fn parse_price_change_bid_ask(
         .iter()
         .filter_map(|level| {
             let level_asset = level.get("asset_id").and_then(Value::as_str)?;
-            if !subscription.asset_ids.iter().any(|a| a == level_asset) {
+            if !subscription.accepts_asset(level_asset, preferred_asset) {
                 return None;
             }
             let bid = level.get("best_bid").and_then(parse_price)?;
@@ -958,5 +970,4 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
 
