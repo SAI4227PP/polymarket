@@ -23,6 +23,8 @@ import (
 type traderState struct {
 	TSMs            uint64  `json:"ts_ms"`
 	PolymarketMid   float64 `json:"polymarket_mid"`
+	PolymarketProb  float64 `json:"polymarket_probability"`
+	FairValueProb   float64 `json:"fair_value_probability"`
 	BinanceMid      float64 `json:"binance_mid"`
 	EdgeBps         float64 `json:"edge_bps"`
 	NetEdgeBps      float64 `json:"net_edge_bps"`
@@ -34,6 +36,21 @@ type traderState struct {
 	DayPnlUSD       float64 `json:"day_pnl_usd"`
 }
 
+type completedTrade struct {
+	ID               string  `json:"id"`
+	Pair             string  `json:"pair"`
+	Direction        string  `json:"direction"`
+	Quantity         float64 `json:"quantity"`
+	EntryPrice       float64 `json:"entry_price"`
+	ExitPrice        float64 `json:"exit_price"`
+	EntryNotionalUSD float64 `json:"entry_notional_usd"`
+	ExitNotionalUSD  float64 `json:"exit_notional_usd"`
+	PnlUSD           float64 `json:"pnl_usd"`
+	EntryTSMs        uint64  `json:"entry_ts_ms"`
+	ExitTSMs         uint64  `json:"exit_ts_ms"`
+	DurationMs       uint64  `json:"duration_ms"`
+	Outcome          string  `json:"outcome"`
+}
 type streamEnvelope struct {
 	Type      string      `json:"type"`
 	Timestamp time.Time   `json:"timestamp"`
@@ -42,6 +59,7 @@ type streamEnvelope struct {
 
 type streamFrame struct {
 	Snapshot  runner.Snapshot        `json:"snapshot"`
+    Trades    interface{}            `json:"trades"`
 	Market    map[string]interface{} `json:"market"`
 	Signal    map[string]interface{} `json:"signal"`
 	Execution map[string]interface{} `json:"execution"`
@@ -76,6 +94,7 @@ func main() {
 	tradesKey := getenv("REDIS_TRADES_KEY", "api:trades:latest")
 	configKey := getenv("REDIS_CONFIG_KEY", "api:config:latest")
 	traderStateKey := getenv("REDIS_TRADER_STATE_KEY", "trader:state:latest")
+	finalTradesKey := getenv("REDIS_FINAL_TRADES_KEY", "trader:trades:latest")
 
 	go refreshRedisCache(logger, svc, cache, snapshotKey, statusKey, metricsKey, tradesKey, configKey)
 
@@ -119,13 +138,23 @@ func main() {
 	})
 
 	mux.HandleFunc("/trades", func(w http.ResponseWriter, r *http.Request) {
+		limit := queryIntBounded(r, "limit", 50, 5000)
+
+		var finalTrades []completedTrade
+		if err := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond); err == nil {
+			if limit > 0 && len(finalTrades) > limit {
+				finalTrades = finalTrades[len(finalTrades)-limit:]
+			}
+			writeJSON(w, http.StatusOK, finalTrades)
+			return
+		}
+
 		var trades []storage.TradeRecord
 		if err := readCachedJSONWithTimeout(r.Context(), cache, tradesKey, &trades, 1200*time.Millisecond); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
 		statusFilter := storage.TradeStatus(strings.TrimSpace(r.URL.Query().Get("status")))
-		limit := queryIntBounded(r, "limit", 50, 5000)
 		trades = filterTrades(trades, statusFilter)
 		if limit > 0 && len(trades) > limit {
 			trades = trades[:limit]
@@ -172,6 +201,12 @@ func main() {
 			var state traderState
 			stateErr := readCachedJSONWithTimeout(r.Context(), cache, traderStateKey, &state, 1500*time.Millisecond)
 
+			tradesPayload := interface{}(snap.Trades)
+			var finalTrades []completedTrade
+			if err := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond); err == nil {
+				tradesPayload = finalTrades
+			}
+
 			if snapErr != nil {
 				_ = conn.WriteJSON(streamEnvelope{
 					Type:      "error",
@@ -207,6 +242,8 @@ func main() {
 
 			if stateErr == nil {
 				marketSection["polymarket_mid"] = state.PolymarketMid
+				marketSection["polymarket_probability"] = state.PolymarketProb
+				marketSection["fair_value_probability"] = state.FairValueProb
 				marketSection["binance_mid"] = state.BinanceMid
 				marketSection["ts_ms"] = state.TSMs
 
@@ -228,6 +265,7 @@ func main() {
 				Timestamp: time.Now().UTC(),
 				Data: streamFrame{
 					Snapshot:  snap,
+					Trades:    tradesPayload,
 					Market:    marketSection,
 					Signal:    signalSection,
 					Execution: execSection,
@@ -374,3 +412,5 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+

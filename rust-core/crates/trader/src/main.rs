@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use adapters_binance::{ws as binance_ws, BinanceClient};
 use adapters_polymarket::{ws as polymarket_ws, PolymarketClient};
-use common::Quote;
+use common::{Quote, TradeDirection};
 use execution_engine::order_manager::{self, ExecutionConfig};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use risk_engine::kill_switch::{should_kill, KillSwitchConfig, KillSwitchState};
@@ -13,14 +13,39 @@ use tokio::time::{interval, sleep, Duration};
 
 #[derive(Debug, Clone)]
 struct PendingPosition {
+    id: String,
+    direction: TradeDirection,
+    quantity: f64,
+    entry_price: f64,
+    entry_notional_usd: f64,
+    entry_ts_ms: u64,
     settle_at_ms: u64,
     expected_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompletedTrade {
+    id: String,
+    pair: String,
+    direction: String,
+    quantity: f64,
+    entry_price: f64,
+    exit_price: f64,
+    entry_notional_usd: f64,
+    exit_notional_usd: f64,
+    pnl_usd: f64,
+    entry_ts_ms: u64,
+    exit_ts_ms: u64,
+    duration_ms: u64,
+    outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct TraderState {
     ts_ms: u64,
     polymarket_mid: f64,
+    polymarket_probability: f64,
+    fair_value_probability: f64,
     binance_mid: f64,
     edge_bps: f64,
     net_edge_bps: f64,
@@ -48,12 +73,16 @@ async fn main() -> Result<()> {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let redis_state_key = std::env::var("REDIS_TRADER_STATE_KEY")
         .unwrap_or_else(|_| "trader:state:latest".to_string());
+    let redis_final_trades_key = std::env::var("REDIS_FINAL_TRADES_KEY")
+        .unwrap_or_else(|_| "trader:trades:latest".to_string());
+    let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
 
     let signal_cfg = SignalConfig {
         min_edge_bps,
         anchor_price: env_f64("BINANCE_ANCHOR_PRICE", 100_000.0),
         basis_bps: env_f64("BINANCE_BASIS_BPS", 0.0),
         target_notional_usd: order_notional_usd,
+        microstructure_model_weight: env_f64("BINANCE_SIGNAL_WEIGHT", 0.35),
         ..SignalConfig::default()
     };
 
@@ -98,13 +127,18 @@ async fn main() -> Result<()> {
     let mut ticker = interval(Duration::from_millis(loop_ms));
     let mut day_pnl_usd = 0.0;
     let mut pending_positions: Vec<PendingPosition> = Vec::new();
+    let mut trade_history: Vec<CompletedTrade> = Vec::new();
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
 
     loop {
         ticker.tick().await;
 
-        settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
+        let closed = settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
+        if !closed.is_empty() {
+            trade_history.extend(closed);
+            trim_history(&mut trade_history, trade_history_limit);
+        }
         let open_positions = pending_positions.len();
 
         let iteration = run_iteration(
@@ -119,6 +153,7 @@ async fn main() -> Result<()> {
             position_ttl_ms,
             account_equity_usd,
             realized_vol_bps,
+            kill_cfg.max_stale_data_ms,
         )
         .await;
 
@@ -140,6 +175,17 @@ async fn main() -> Result<()> {
                 .await
                 {
                     eprintln!("redis publish error: {err:#}");
+                }
+
+                if let Err(err) = publish_trades_to_redis(
+                    &redis_url,
+                    &redis_final_trades_key,
+                    &trade_history,
+                    &mut redis_conn,
+                )
+                .await
+                {
+                    eprintln!("redis trade-history publish error: {err:#}");
                 }
             }
             Err(err) => {
@@ -191,6 +237,7 @@ async fn run_iteration(
     position_ttl_ms: u64,
     account_equity_usd: f64,
     realized_vol_bps: f64,
+    max_quote_age_ms: u64,
 ) -> Result<IterationOutcome> {
     let pm_quote = match pm_rx.borrow().clone() {
         Some(q) => q,
@@ -214,6 +261,12 @@ async fn run_iteration(
     };
 
     let signal = compute_signal(&pm_quote, &bn_quote, signal_cfg);
+    let fair_value_probability = (pm_quote.price + (signal.edge_bps / 10_000.0)).clamp(0.0, 1.0);
+    let now = now_ms();
+    let pm_quote_age_ms = now.saturating_sub(pm_quote.ts_ms);
+    let bn_quote_age_ms = now.saturating_sub(bn_quote.ts_ms);
+    let pm_fresh = pm_quote_age_ms <= max_quote_age_ms;
+    let bn_fresh = bn_quote_age_ms <= max_quote_age_ms;
 
     let gross_exposure_usd = (open_positions as f64 * order_notional_usd) + order_notional_usd;
     let risk = evaluate_trade(
@@ -230,7 +283,7 @@ async fn run_iteration(
     );
 
     let top_book_liquidity_usd = env_f64("TOP_BOOK_LIQUIDITY_USD", 5_000.0);
-    let intent = if risk.allowed {
+    let intent = if risk.allowed && pm_fresh {
         order_manager::build_order_intent(
             "BTC",
             &signal,
@@ -243,15 +296,28 @@ async fn run_iteration(
     } else {
         None
     };
+    let submitted_intent = intent.clone();
     let filled_notional_usd = intent
         .as_ref()
         .map(|o| o.quantity * o.limit_price)
         .unwrap_or(0.0);
     let report = order_manager::submit_if_needed(intent);
+    let has_open_positions = open_positions > 0;
+    let entry_signal = signal.should_trade && risk.allowed && report.accepted;
+    let exit_signal = has_open_positions && (!signal.should_trade || !risk.allowed);
+    let action = if !pm_fresh {
+        "hold_stale_polymarket"
+    } else if !bn_fresh {
+        "hold_stale_binance_depth"
+    } else if entry_signal {
+        "entry_signal"
+    } else if exit_signal {
+        "exit_signal"
+    } else {
+        "hold"
+    };
 
-    let oldest_quote_age_ms = now_ms()
-        .saturating_sub(pm_quote.ts_ms)
-        .max(now_ms().saturating_sub(bn_quote.ts_ms));
+    let oldest_quote_age_ms = pm_quote_age_ms.max(bn_quote_age_ms);
 
     println!(
         "edge_bps={:.2} net_edge_bps={:.2} dir={:?} pm_mid={:.4} bn_mid={:.2} risk_allowed={} open_positions={} day_pnl={} route={} status={}",
@@ -270,16 +336,14 @@ async fn run_iteration(
     let state = TraderState {
         ts_ms: now_ms(),
         polymarket_mid: pm_quote.price,
+        polymarket_probability: pm_quote.price.clamp(0.0, 1.0),
+        fair_value_probability,
         binance_mid: bn_quote.price,
         edge_bps: signal.edge_bps,
         net_edge_bps: signal.net_edge_bps,
         direction: format!("{:?}", signal.direction),
         risk_allowed: risk.allowed,
-        action: if signal.should_trade {
-            "trade".to_string()
-        } else {
-            "hold".to_string()
-        },
+        action: action.to_string(),
         execution_status: report.status.clone(),
         open_positions,
         day_pnl_usd,
@@ -288,13 +352,22 @@ async fn run_iteration(
 
     if report.accepted {
         let expected_pnl_usd = filled_notional_usd * (signal.net_edge_bps / 10_000.0);
-        return Ok(IterationOutcome {
-            position: Some(PendingPosition {
-                settle_at_ms: now_ms().saturating_add(position_ttl_ms),
-                expected_pnl_usd,
-            }),
-            state,
-        });
+        if let Some(order) = submitted_intent {
+            let ts = now_ms();
+            return Ok(IterationOutcome {
+                position: Some(PendingPosition {
+                    id: format!("BTC-{}", ts),
+                    direction: order.direction,
+                    quantity: order.quantity,
+                    entry_price: order.limit_price,
+                    entry_notional_usd: order.quantity * order.limit_price,
+                    entry_ts_ms: ts,
+                    settle_at_ms: ts.saturating_add(position_ttl_ms),
+                    expected_pnl_usd,
+                }),
+                state,
+            });
+        }
     }
 
     Ok(IterationOutcome {
@@ -331,10 +404,40 @@ async fn publish_state_to_redis(
     Ok(())
 }
 
+async fn publish_trades_to_redis(
+    redis_url: &str,
+    key: &str,
+    trades: &[CompletedTrade],
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    let payload = serde_json::to_string(trades).context("serialize trade history")?;
+
+    if let Some(c) = conn.as_mut() {
+        let set_res: redis::RedisResult<()> = c.set(key, payload).await;
+        if let Err(e) = set_res {
+            *conn = None;
+            return Err(anyhow!("redis set trades failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
+
 fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
     TraderState {
         ts_ms: now_ms(),
         polymarket_mid: 0.0,
+        polymarket_probability: 0.0,
+        fair_value_probability: 0.0,
         binance_mid: 0.0,
         edge_bps: 0.0,
         net_edge_bps: 0.0,
@@ -374,16 +477,57 @@ fn settle_expired_positions(
     pending_positions: &mut Vec<PendingPosition>,
     day_pnl_usd: &mut f64,
     now_ms: u64,
-) {
+) -> Vec<CompletedTrade> {
     let mut keep = Vec::with_capacity(pending_positions.len());
+    let mut closed = Vec::new();
+
     for pos in pending_positions.drain(..) {
         if pos.settle_at_ms <= now_ms {
             *day_pnl_usd += pos.expected_pnl_usd;
+            let exit_notional_usd = (pos.entry_notional_usd + pos.expected_pnl_usd).max(0.0);
+            let exit_price = if pos.quantity > 0.0 {
+                exit_notional_usd / pos.quantity
+            } else {
+                pos.entry_price
+            };
+
+            closed.push(CompletedTrade {
+                id: pos.id,
+                pair: "BTC".to_string(),
+                direction: format!("{:?}", pos.direction),
+                quantity: pos.quantity,
+                entry_price: pos.entry_price,
+                exit_price,
+                entry_notional_usd: pos.entry_notional_usd,
+                exit_notional_usd,
+                pnl_usd: pos.expected_pnl_usd,
+                entry_ts_ms: pos.entry_ts_ms,
+                exit_ts_ms: now_ms,
+                duration_ms: now_ms.saturating_sub(pos.entry_ts_ms),
+                outcome: if pos.expected_pnl_usd >= 0.0 {
+                    "profit".to_string()
+                } else {
+                    "loss".to_string()
+                },
+            });
         } else {
             keep.push(pos);
         }
     }
+
     *pending_positions = keep;
+    closed
+}
+
+fn trim_history(history: &mut Vec<CompletedTrade>, max_len: usize) {
+    if max_len == 0 {
+        history.clear();
+        return;
+    }
+    if history.len() > max_len {
+        let drop_n = history.len() - max_len;
+        history.drain(0..drop_n);
+    }
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
@@ -407,4 +551,3 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
