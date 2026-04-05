@@ -5,9 +5,10 @@ COPY go-services/go.mod ./
 RUN go mod download
 COPY go-services/cmd ./cmd
 COPY go-services/internal ./internal
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/supervisor ./cmd/supervisor
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -o /out/supervisor ./cmd/supervisor
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 COPY --from=builder /out/supervisor /app/supervisor
 ENTRYPOINT ["/app/supervisor"]
+
