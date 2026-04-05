@@ -142,6 +142,10 @@ async fn main() -> Result<()> {
         if let Some(q) = pm_snapshot.as_ref() {
             if q.venue == "polymarket-past-results" {
                 last_past_probability = Some(q.price.clamp(0.0, 1.0));
+            } else if q.venue == "polymarket-prior" && last_past_probability.is_none() {
+                // Fallback: if the explicit past-results seed was missed between loop ticks,
+                // reuse prior probability so API websocket always has a past_outcomes payload.
+                last_past_probability = Some(q.price.clamp(0.0, 1.0));
             }
         }
 
