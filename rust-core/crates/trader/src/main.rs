@@ -60,9 +60,14 @@ struct TraderState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let pm_instrument_id = polymarket_ws::resolve_instrument_id_from_env()
+    let resolved_pm = polymarket_ws::resolve_instrument_from_env()
         .await
         .context("failed to resolve Polymarket instrument (env IDs, event URL/slug, or auto-today fallback)")?;
+    let pm_instrument_id = resolved_pm.instrument_id.clone();
+    println!(
+        "trader bootstrap: polymarket instrument={} source={}",
+        pm_instrument_id, resolved_pm.source
+    );
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
 
     let loop_ms = env_u64("LOOP_INTERVAL_MS", 1_000);

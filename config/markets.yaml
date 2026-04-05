@@ -1,7 +1,13 @@
 pair: BTC
 polymarket_asset_id: ""
 polymarket_market_id: ""
-polymarket_market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+polymarket_event_url: ""
+polymarket_event_slug: ""
+polymarket_auto_event_prefix: "btc-updown-5m"
+polymarket_auto_event_mode: "epoch_5m"
+polymarket_market_ws_url: "wss://ws-subscriptions-frontend-clob.polymarket.com/ws/market"
+polymarket_gamma_api_url: "https://gamma-api.polymarket.com"
 binance_symbol: "BTCUSDT"
 binance_ws_url: "wss://stream.binance.com:9443/ws"
+
 

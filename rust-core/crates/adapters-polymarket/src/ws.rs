@@ -81,12 +81,24 @@ fn first_non_empty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-pub async fn resolve_instrument_id_from_env() -> Result<String> {
+#[derive(Debug, Clone)]
+pub struct ResolvedInstrument {
+    pub instrument_id: String,
+    pub source: String,
+}
+
+pub async fn resolve_instrument_from_env() -> Result<ResolvedInstrument> {
     if let Some(asset_id) = first_non_empty_env("POLYMARKET_ASSET_ID") {
-        return Ok(asset_id);
+        return Ok(ResolvedInstrument {
+            instrument_id: asset_id,
+            source: "env:POLYMARKET_ASSET_ID".to_string(),
+        });
     }
     if let Some(market_id) = first_non_empty_env("POLYMARKET_MARKET_ID") {
-        return Ok(market_id);
+        return Ok(ResolvedInstrument {
+            instrument_id: market_id,
+            source: "env:POLYMARKET_MARKET_ID".to_string(),
+        });
     }
 
     if let Some(event_url) = first_non_empty_env("POLYMARKET_EVENT_URL") {
@@ -106,22 +118,39 @@ pub async fn resolve_instrument_id_from_env() -> Result<String> {
                 } else {
                     None
                 };
-                return resolve_market_id_from_event_slug(event_slug, preferred_market_slug).await;
+                let instrument_id =
+                    resolve_market_id_from_event_slug(event_slug, preferred_market_slug).await?;
+                return Ok(ResolvedInstrument {
+                    instrument_id,
+                    source: format!("env:POLYMARKET_EVENT_URL:{}", event_slug),
+                });
             }
         }
-        bail!("POLYMARKET_EVENT_URL must look like /event/{{event-slug}}[/market-slug]");
+        bail!("POLYMARKET_EVENT_URL must look like /event/{event-slug}[/market-slug]");
     }
 
     if let Some(event_slug) = first_non_empty_env("POLYMARKET_EVENT_SLUG") {
-        return resolve_market_id_from_event_slug(&event_slug, None).await;
+        let instrument_id = resolve_market_id_from_event_slug(&event_slug, None).await?;
+        return Ok(ResolvedInstrument {
+            instrument_id,
+            source: format!("env:POLYMARKET_EVENT_SLUG:{}", event_slug),
+        });
     }
 
     let auto_event_slug = auto_today_event_slug();
-    resolve_market_id_from_event_slug(&auto_event_slug, None)
+    let instrument_id = resolve_market_id_from_event_slug(&auto_event_slug, None)
         .await
-        .with_context(|| format!("auto-resolve failed for event slug {auto_event_slug}"))
+        .with_context(|| format!("auto-resolve failed for event slug {auto_event_slug}"))?;
+
+    Ok(ResolvedInstrument {
+        instrument_id,
+        source: format!("auto:event-slug:{}", auto_event_slug),
+    })
 }
 
+pub async fn resolve_instrument_id_from_env() -> Result<String> {
+    Ok(resolve_instrument_from_env().await?.instrument_id)
+}
 async fn resolve_market_id_from_event_slug(
     event_slug: &str,
     preferred_market_slug: Option<&str>,
@@ -300,9 +329,27 @@ fn parse_condition_id_from_activity_message(payload: &Value, event_slug: &str) -
 
 fn auto_today_event_slug() -> String {
     let prefix = first_non_empty_env("POLYMARKET_AUTO_EVENT_PREFIX")
-        .unwrap_or_else(|| "bitcoin-above-on".to_string());
+        .unwrap_or_else(|| "btc-updown-5m".to_string());
+    let mode = first_non_empty_env("POLYMARKET_AUTO_EVENT_MODE").unwrap_or_else(|| {
+        if prefix.starts_with("btc-updown-5m") {
+            "epoch_5m".to_string()
+        } else {
+            "daily_date".to_string()
+        }
+    });
+
+    if mode.eq_ignore_ascii_case("epoch_5m") {
+        let bucket = current_5m_bucket_unix();
+        return format!("{}-{}", prefix, bucket);
+    }
+
     let now = Utc::now().date_naive();
     format!("{}-{}-{}", prefix, month_name(now.month()), now.day())
+}
+
+fn current_5m_bucket_unix() -> i64 {
+    let ts = Utc::now().timestamp();
+    ts - ts.rem_euclid(300)
 }
 
 fn month_name(month: u32) -> &'static str {
@@ -324,7 +371,7 @@ fn month_name(month: u32) -> &'static str {
 }
 pub async fn stream_best_bid_ask(instrument_id: &str) -> Result<Quote> {
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
-        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());
+        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_FRONTEND.to_string());
 
     match stream_market_quote_from_endpoint(instrument_id, &market_ws_url).await {
         Ok(q) => Ok(q),
@@ -337,7 +384,7 @@ pub async fn run_market_quote_stream(
     tx: watch::Sender<Option<Quote>>,
 ) -> Result<()> {
     let market_ws_url = std::env::var("POLYMARKET_MARKET_WS_URL")
-        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_CLOB.to_string());
+        .unwrap_or_else(|_| POLYMARKET_WS_MARKET_FRONTEND.to_string());
 
     match run_market_quote_stream_from_endpoint(instrument_id, &market_ws_url, tx.clone()).await {
         Ok(()) => Ok(()),
@@ -561,7 +608,120 @@ async fn resolve_market_asset_ids(market_id: &str) -> Result<Vec<String>> {
         }
     }
 
+    let by_condition_snake = format!("{base}/markets?condition_id={market_id}");
+    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_condition_snake).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+    let by_condition_camel = format!("{base}/markets?conditionId={market_id}");
+    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_condition_camel).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+
+    if let Ok(ids) = resolve_market_asset_ids_from_activity_ws(market_id).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
     bail!("could not resolve market asset ids for market_id={market_id}");
+}
+
+
+async fn resolve_market_asset_ids_from_activity_ws(condition_id: &str) -> Result<Vec<String>> {
+    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
+    let (mut ws, _) = connect_async(url.as_str())
+        .await
+        .context("failed to connect to polymarket live-data websocket for asset-id fallback")?;
+
+    let subscribe = json!({
+        "action": "subscribe",
+        "subscriptions": [
+            {
+                "topic": "activity",
+                "type": "orders_matched",
+                "filters": "{}"
+            }
+        ]
+    });
+
+    ws.send(Message::Text(subscribe.to_string().into()))
+        .await
+        .context("failed to subscribe live-data activity stream for asset-id fallback")?;
+
+    let deadline = Duration::from_secs(25);
+    let start = std::time::Instant::now();
+    let mut ids: Vec<String> = Vec::new();
+
+    while start.elapsed() <= deadline {
+        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
+        let Some(msg) = (match next {
+            Ok(v) => v,
+            Err(_) => {
+                ws.send(Message::Ping(Vec::new().into()))
+                    .await
+                    .context("failed to ping live-data activity stream")?;
+                continue;
+            }
+        }) else {
+            break;
+        };
+
+        let msg = msg.context("live-data activity stream read error")?;
+        match msg {
+            Message::Text(text) => {
+                let payload: Value = serde_json::from_str(&text)
+                    .context("failed to parse live-data activity stream message")?;
+                let topic = payload.get("topic").and_then(Value::as_str);
+                let ty = payload.get("type").and_then(Value::as_str);
+                if topic != Some("activity") || ty != Some("orders_matched") {
+                    continue;
+                }
+
+                let item = match payload.get("payload") {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let cid = item
+                    .get("conditionId")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("condition_id").and_then(Value::as_str));
+                if cid != Some(condition_id) {
+                    continue;
+                }
+
+                if let Some(asset) = item
+                    .get("asset")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("asset_id").and_then(Value::as_str))
+                {
+                    let asset = asset.trim();
+                    if !asset.is_empty() && !ids.iter().any(|v| v == asset) {
+                        ids.push(asset.to_string());
+                        if ids.len() >= 2 {
+                            break;
+                        }
+                    }
+                }
+            }
+            Message::Ping(payload) => {
+                ws.send(Message::Pong(payload))
+                    .await
+                    .context("failed to pong live-data activity stream")?;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    if ids.is_empty() {
+        bail!("no matching activity assets found for condition_id={condition_id}");
+    }
+    Ok(ids)
 }
 
 async fn fetch_market_asset_ids_from_gamma(client: &reqwest::Client, url: &str) -> Result<Vec<String>> {
