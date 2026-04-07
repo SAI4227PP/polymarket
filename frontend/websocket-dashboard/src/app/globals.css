@@ -1,0 +1,44 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f7f3e9;
+  --foreground: #101312;
+  --surface: rgba(255, 255, 255, 0.72);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-heading);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  background-image:
+    radial-gradient(circle at 8% 12%, rgba(230, 120, 40, 0.25), transparent 28%),
+    radial-gradient(circle at 88% 22%, rgba(50, 130, 255, 0.2), transparent 30%),
+    linear-gradient(130deg, #f7f3e9 0%, #efe5d4 52%, #e8dcc7 100%);
+}
+
+main {
+  animation: reveal 480ms ease-out;
+}
+
+::selection {
+  background: #15343b;
+  color: #f6f3ea;
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

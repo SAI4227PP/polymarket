@@ -1422,7 +1422,10 @@ fn current_open_direction(pending_positions: &[PendingPosition]) -> Option<Trade
 }
 
 fn is_tradeable_polymarket_quote(q: &Quote) -> bool {
-    matches!(q.venue.as_str(), "polymarket" | "polymarket-live-data")
+    matches!(
+        q.venue.as_str(),
+        "polymarket" | "polymarket-live-data" | "polymarket-gamma" | "polymarket-prior"
+    )
 }
 
 fn close_positions_now(
