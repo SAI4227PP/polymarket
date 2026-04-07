@@ -2,10 +2,14 @@
 FROM golang:1.23 as builder
 WORKDIR /workspace/go-services
 COPY go-services/go.mod ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+	--mount=type=cache,target=/root/.cache/go-build \
+	go mod download
 COPY go-services/cmd ./cmd
 COPY go-services/internal ./internal
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -o /out/supervisor ./cmd/supervisor
+RUN --mount=type=cache,target=/go/pkg/mod \
+	--mount=type=cache,target=/root/.cache/go-build \
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=mod -o /out/supervisor ./cmd/supervisor
 
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app

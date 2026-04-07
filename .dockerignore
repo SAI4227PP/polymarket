@@ -1,0 +1,22 @@
+.git
+.gitignore
+.env
+.env.*
+**/.DS_Store
+**/Thumbs.db
+**/*.log
+
+# Build outputs and caches
+**/target
+**/bin
+**/dist
+**/.cache
+
+# Editor/tooling
+.vscode
+.idea
+
+# Test artifacts
+coverage*
+**/tmp
+**/temp

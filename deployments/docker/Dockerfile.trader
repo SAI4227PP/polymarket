@@ -6,7 +6,11 @@ COPY rust-core/Cargo.toml rust-core/Cargo.toml
 COPY rust-core/crates rust-core/crates
 
 WORKDIR /workspace/rust-core
-RUN cargo build --release -p trader
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/workspace/rust-core/target \
+    cargo build --release -p trader \
+    && cp /workspace/rust-core/target/release/trader /tmp/trader
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -14,6 +18,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 10001 trader
 WORKDIR /app
-COPY --from=builder /workspace/rust-core/target/release/trader /app/trader
+COPY --from=builder /tmp/trader /app/trader
 USER trader
 ENTRYPOINT ["/app/trader"]
