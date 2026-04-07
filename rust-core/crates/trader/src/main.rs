@@ -599,13 +599,24 @@ async fn run_iteration(
     let hold_strong_edge_bps = env_f64("HOLD_STRONG_EDGE_BPS", (signal_cfg.min_edge_bps * 0.6).max(1.0));
     let invalidation_close_bps =
         env_f64("INVALIDATION_CLOSE_BPS", (signal_cfg.min_edge_bps * 0.8).max(4.0));
-    let strong_same_direction = has_open_positions
+    let same_direction_hold = has_open_positions
         && open_direction
-            .map(|d| signal.direction == d && signal.net_edge_bps >= hold_strong_edge_bps)
+            .map(|d| signal.direction == d && signal.direction != TradeDirection::Flat)
             .unwrap_or(false);
+    let strong_same_direction = same_direction_hold && signal.net_edge_bps >= hold_strong_edge_bps;
     let invalidation_deadband_hold = has_open_positions
+        && !reversal_signal
         && !signal.should_trade
         && signal.net_edge_bps.abs() < invalidation_close_bps;
+
+    let no_trade_signal = signal.direction == TradeDirection::Flat;
+    let weak_edge_invalidation = signal.net_edge_bps.abs() < invalidation_close_bps;
+
+    let seconds_left_in_5m = 300_u64.saturating_sub((now / 1_000) % 300);
+    let strong_win_zone = has_open_positions
+        && seconds_left_in_5m <= env_u64("NEAR_CERTAINTY_HOLD_SECONDS", 15)
+        && same_direction_hold
+        && signal.net_edge_bps.abs() >= hold_strong_edge_bps;
 
     if !report.accepted && has_open_positions && strong_same_direction {
         report.status = format!(
@@ -619,21 +630,23 @@ async fn run_iteration(
         );
     }
 
-    let close_reason = if reversal_signal {
+    let mut close_reason = if reversal_signal {
         Some("reverse_signal".to_string())
-    } else if has_open_positions
-        && !signal.should_trade
-        && !strong_same_direction
-        && !invalidation_deadband_hold
-    {
-        Some("signal_invalidated".to_string())
     } else if has_open_positions && !pm_fresh {
         Some("stale_polymarket".to_string())
     } else if has_open_positions && !bn_fresh {
         Some("stale_binance".to_string())
+    } else if has_open_positions && !same_direction_hold && (weak_edge_invalidation || no_trade_signal) {
+        Some("signal_invalidated".to_string())
+    } else if has_open_positions && invalidation_deadband_hold {
+        None
     } else {
         None
     };
+
+    if strong_win_zone {
+        close_reason = None;
+    }
     let exit_signal = close_reason.is_some();
 
     let position_signal = if entry_signal {
@@ -662,6 +675,10 @@ async fn run_iteration(
         "hold_stale_binance_depth"
     } else if blocked_last_seconds_5m && can_open_new_position {
         "hold_last_seconds_5m_guard"
+    } else if has_open_positions && strong_win_zone {
+        "hold_near_certainty"
+    } else if has_open_positions && same_direction_hold {
+        "hold_to_expiry"
     } else if has_open_positions && strong_same_direction {
         "hold_strong_direction"
     } else if reversal_signal {

@@ -265,8 +265,6 @@ func main() {
 		ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 		defer ticker.Stop()
 		initialBootstrapSent := false
-		lastRunningTradesSig := ""
-		lastCompletedTradesSig := ""
 		lastPortfolioSig := ""
 
 		for {
@@ -312,10 +310,7 @@ func main() {
                 }
             }
 
-            lastTradeStatus := "none"
-            if len(snap.Trades) > 0 {
-                lastTradeStatus = string(snap.Trades[0].Status)
-            }
+			lastTradeStatus := "none"
 
             marketSection := map[string]interface{}{
                 "polymarket_mid": nil,
@@ -368,6 +363,12 @@ func main() {
                 execSection["execution_status"] = state.ExecutionStatus
                 execSection["open_positions"] = state.OpenPositions
                 execSection["open_trades"] = state.OpenPositions
+				if state.OpenPositions > 0 {
+					lastTradeStatus = "open"
+				} else {
+					lastTradeStatus = "closed"
+				}
+				execSection["latest_trade_status"] = lastTradeStatus
                 portfolioSection["net_qty"] = state.PortfolioNetQty
                 portfolioSection["avg_entry"] = state.PortfolioAvgEntry
                 portfolioSection["unrealized_pnl_usd"] = state.PortfolioUnrealizedPnL
@@ -393,9 +394,7 @@ func main() {
                     portfolioSection["today_stats"] = todayStats
                 }
             }
-            execSection["day_pnl_usd"] = portfolioSection["day_pnl_usd"]
-			runningTradesSig := payloadSignature(runningTradesPayload)
-			completedTradesSig := payloadSignature(completedTradesPayload)
+			execSection["day_pnl_usd"] = portfolioSection["day_pnl_usd"]
 			portfolioSig := payloadSignature(portfolioSection)
 			snapshotData := map[string]interface{}{
 				"generated_at":     snap.GeneratedAt,
@@ -424,16 +423,6 @@ func main() {
 						Type:      "portfolio",
 						Timestamp: now,
 						Data:      portfolioSection,
-					},
-					streamEnvelope{
-						Type:      "trades",
-						Timestamp: now,
-						Data:      runningTradesPayload,
-					},
-                    streamEnvelope{
-                        Type:      "completed_trades",
-                        Timestamp: now,
-                        Data:      completedTradesPayload,
                     },
 				)
 			}
@@ -463,21 +452,17 @@ func main() {
                     Timestamp: now,
                     Data:      pastOutcomesPayload,
                 },
+				streamEnvelope{
+					Type:      "trades",
+					Timestamp: now,
+					Data:      runningTradesPayload,
+				},
+				streamEnvelope{
+					Type:      "completed_trades",
+					Timestamp: now,
+					Data:      completedTradesPayload,
+				},
 			)
-            if initialBootstrapSent && runningTradesSig != lastRunningTradesSig {
-                events = append(events, streamEnvelope{
-                    Type:      "trades",
-                    Timestamp: now,
-                    Data:      runningTradesPayload,
-                })
-            }
-            if initialBootstrapSent && completedTradesSig != lastCompletedTradesSig {
-                events = append(events, streamEnvelope{
-                    Type:      "completed_trades",
-                    Timestamp: now,
-                    Data:      completedTradesPayload,
-                })
-            }
             if initialBootstrapSent && portfolioSig != lastPortfolioSig {
                 events = append(events, streamEnvelope{
                     Type:      "portfolio",
@@ -493,8 +478,6 @@ func main() {
 				}
 			}
 			initialBootstrapSent = true
-            lastRunningTradesSig = runningTradesSig
-            lastCompletedTradesSig = completedTradesSig
             lastPortfolioSig = portfolioSig
 			select {
 			case <-r.Context().Done():
