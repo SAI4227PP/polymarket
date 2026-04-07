@@ -267,6 +267,7 @@ func main() {
 		initialBootstrapSent := false
 		lastRunningTradesSig := ""
 		lastCompletedTradesSig := ""
+		lastPortfolioSig := ""
 
 		for {
 			var snap runner.Snapshot
@@ -395,6 +396,7 @@ func main() {
             }
 			runningTradesSig := payloadSignature(runningTradesPayload)
 			completedTradesSig := payloadSignature(completedTradesPayload)
+			portfolioSig := payloadSignature(portfolioSection)
 			now := time.Now().UTC()
 			events := make([]streamEnvelope, 0, 10)
 			if !initialBootstrapSent {
@@ -462,6 +464,13 @@ func main() {
                     Data:      completedTradesPayload,
                 })
             }
+            if initialBootstrapSent && portfolioSig != lastPortfolioSig {
+                events = append(events, streamEnvelope{
+                    Type:      "portfolio",
+                    Timestamp: now,
+                    Data:      portfolioSection,
+                })
+            }
 			for _, env := range events {
 				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 				if err := conn.WriteJSON(env); err != nil {
@@ -472,6 +481,7 @@ func main() {
 			initialBootstrapSent = true
             lastRunningTradesSig = runningTradesSig
             lastCompletedTradesSig = completedTradesSig
+            lastPortfolioSig = portfolioSig
 			select {
 			case <-r.Context().Done():
 				return
@@ -785,3 +795,6 @@ func payloadSignature(v interface{}) string {
 	}
 	return string(b)
 }
+
+
+
