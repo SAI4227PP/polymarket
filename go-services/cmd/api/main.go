@@ -30,6 +30,7 @@ type traderState struct {
 	NetEdgeBps      float64 `json:"net_edge_bps"`
 	Direction       string  `json:"direction"`
 	RiskAllowed     bool    `json:"risk_allowed"`
+	RiskReason      string  `json:"risk_reason"`
 	Action          string  `json:"action"`
 	PositionSignal  string  `json:"position_signal"`
 	EntrySignal     bool    `json:"entry_signal"`
@@ -323,6 +324,7 @@ func main() {
             signalSection := map[string]interface{}{
                 "action":          snap.Report.Action,
                 "risk_allowed":    snap.Report.RiskAllowed,
+				"risk_reason":     "unknown",
                 "tick_seq":        snap.Report.TickSeq,
                 "position_signal": "unknown",
                 "entry_signal":    false,
@@ -360,11 +362,14 @@ func main() {
                 signalSection["edge_bps"] = state.EdgeBps
                 signalSection["net_edge_bps"] = state.NetEdgeBps
                 signalSection["direction"] = state.Direction
+				signalSection["action"] = state.Action
                 signalSection["risk_allowed"] = state.RiskAllowed
+				signalSection["risk_reason"] = state.RiskReason
                 signalSection["position_signal"] = state.PositionSignal
                 signalSection["entry_signal"] = state.EntrySignal
                 signalSection["exit_signal"] = state.ExitSignal
                 signalSection["close_reason"] = state.CloseReason
+				signalSection["execution_status"] = state.ExecutionStatus
 
                 execSection["execution_status"] = state.ExecutionStatus
                 execSection["open_positions"] = state.OpenPositions
@@ -394,11 +399,14 @@ func main() {
 				signalSection["edge_bps"] = lastState.EdgeBps
 				signalSection["net_edge_bps"] = lastState.NetEdgeBps
 				signalSection["direction"] = lastState.Direction
+				signalSection["action"] = lastState.Action
 				signalSection["risk_allowed"] = lastState.RiskAllowed
+				signalSection["risk_reason"] = lastState.RiskReason
 				signalSection["position_signal"] = lastState.PositionSignal
 				signalSection["entry_signal"] = lastState.EntrySignal
 				signalSection["exit_signal"] = lastState.ExitSignal
 				signalSection["close_reason"] = lastState.CloseReason
+				signalSection["execution_status"] = lastState.ExecutionStatus
 
 				execSection["execution_status"] = lastState.ExecutionStatus
 				execSection["open_positions"] = lastState.OpenPositions

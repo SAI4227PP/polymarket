@@ -86,6 +86,7 @@ struct TraderState {
     net_edge_bps: f64,
     direction: String,
     risk_allowed: bool,
+    risk_reason: String,
     action: String,
     position_signal: String,
     entry_signal: bool,
@@ -275,6 +276,7 @@ async fn main() -> Result<()> {
     let mut current_5m_bucket_start_ms: Option<u64> = None;
     let mut current_5m_anchor_price = base_signal_cfg.anchor_price;
     let mut kill_switch_latched = false;
+    let mut transient_kill_blocked_prev = false;
     let mut daily_loss_latched = false;
     let min_peak_pnl_for_drawdown_pct = env_f64("KILL_SWITCH_MIN_PEAK_PNL_USD", 5.0).max(0.0);
     let mut peak_total_pnl_usd = last_trader_state
@@ -352,14 +354,16 @@ async fn main() -> Result<()> {
             .map(|p| p.entry_notional_usd.abs())
             .fold(0.0, f64::max);
 
-        if should_kill(
-            KillSwitchState {
-                current_drawdown_pct,
-                error_streak,
-                oldest_quote_age_ms,
-            },
-            kill_cfg,
-        ) {
+        let kill_state = KillSwitchState {
+            current_drawdown_pct,
+            error_streak,
+            oldest_quote_age_ms,
+        };
+        let kill_triggered = should_kill(kill_state, kill_cfg);
+        let drawdown_breached = current_drawdown_pct >= kill_cfg.max_drawdown_pct;
+        let transient_kill_blocked = kill_triggered && !drawdown_breached;
+
+        if drawdown_breached {
             if !kill_switch_latched {
                 eprintln!(
                     "kill switch latched drawdown_pct={:.2} error_streak={} stale_ms={} (no-new-entries mode)",
@@ -370,6 +374,17 @@ async fn main() -> Result<()> {
             }
             kill_switch_latched = true;
         }
+
+        if transient_kill_blocked && !transient_kill_blocked_prev {
+            eprintln!(
+                "kill switch temporary block error_streak={} stale_ms={} (entries paused until recovery)",
+                error_streak,
+                oldest_quote_age_ms
+            );
+        } else if !transient_kill_blocked && transient_kill_blocked_prev {
+            eprintln!("kill switch temporary block cleared (entries resumed)");
+        }
+        transient_kill_blocked_prev = transient_kill_blocked;
 
         if day_pnl_usd <= -risk_limits.max_daily_loss_usd {
             if !daily_loss_latched {
@@ -382,7 +397,7 @@ async fn main() -> Result<()> {
             daily_loss_latched = true;
         }
 
-        let entries_latched = kill_switch_latched || daily_loss_latched;
+        let entries_latched = kill_switch_latched || daily_loss_latched || transient_kill_blocked;
 
         let iteration = run_iteration(
             &pm_rx,
@@ -684,7 +699,7 @@ async fn run_iteration(
     } else if entries_latched && !has_open_positions {
         RiskDecision {
             allowed: false,
-            reason: "risk latched: entries disabled".to_string(),
+            reason: "entries blocked by kill switch".to_string(),
             violations: Vec::new(),
         }
     } else {
@@ -707,7 +722,7 @@ async fn run_iteration(
         .unwrap_or(0.0);
     let mut report = order_manager::submit_if_needed(intent);
     if !report.accepted && entries_latched && !has_open_positions {
-        report.status = "skipped:risk_latched_no_new_entries".to_string();
+        report.status = "skipped:entries_blocked_no_new_entries".to_string();
     } else if !report.accepted && can_open_new_position && blocked_first_seconds_5m {
         report.status = format!(
             "skipped:first_seconds_5m_guard elapsed_s<{}",
@@ -806,7 +821,7 @@ async fn run_iteration(
     } else if !bn_fresh {
         "hold_stale_binance_depth"
     } else if entries_latched && !has_open_positions {
-        "risk_latched_no_new_entries"
+        "entries_blocked_no_new_entries"
     } else if blocked_first_seconds_5m && can_open_new_position {
         "hold_first_seconds_5m_guard"
     } else if blocked_last_seconds_5m && can_open_new_position {
@@ -853,6 +868,7 @@ async fn run_iteration(
         net_edge_bps: signal.net_edge_bps,
         direction: format!("{:?}", signal.direction),
         risk_allowed: risk.allowed,
+        risk_reason: risk.reason.clone(),
         action: action.to_string(),
         position_signal: position_signal.clone(),
         entry_signal,
@@ -1246,6 +1262,7 @@ fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
         net_edge_bps: 0.0,
         direction: "Flat".to_string(),
         risk_allowed: false,
+        risk_reason: "waiting_quotes".to_string(),
         action: "waiting_quotes".to_string(),
         position_signal: "waiting".to_string(),
         entry_signal: false,
@@ -1970,8 +1987,8 @@ mod tests {
         .expect("iteration should succeed");
 
         assert!(out.position.is_none(), "risk latch should block new entries");
-        assert_eq!(out.state.action, "risk_latched_no_new_entries");
-        assert_eq!(out.state.execution_status, "skipped:risk_latched_no_new_entries");
+        assert_eq!(out.state.action, "entries_blocked_no_new_entries");
+        assert_eq!(out.state.execution_status, "skipped:entries_blocked_no_new_entries");
     }
 
     #[tokio::test]
