@@ -38,12 +38,14 @@ type traderState struct {
 	ExecutionStatus string  `json:"execution_status"`
 	OpenPositions   int     `json:"open_positions"`
 	DayPnlUSD       float64 `json:"day_pnl_usd"`
+	OldestQuoteAgeMs uint64 `json:"oldest_quote_age_ms"`
 	PortfolioNetQty        float64 `json:"portfolio_net_qty"`
 	PortfolioAvgEntry      float64 `json:"portfolio_avg_entry"`
     PortfolioRealizedPnL        float64 `json:"portfolio_realized_pnl_usd"`
 	PortfolioUnrealizedPnL float64 `json:"portfolio_unrealized_pnl_usd"`
 	PortfolioTotalPnL      float64 `json:"portfolio_total_pnl_usd"`
     PortfolioAllTimeRealizedPnL float64 `json:"portfolio_all_time_realized_pnl_usd"`
+	PortfolioDrawdownPctFromPeak float64 `json:"portfolio_drawdown_pct_from_peak"`
 }
 
 type completedTrade struct {
@@ -266,6 +268,8 @@ func main() {
 		defer ticker.Stop()
 		initialBootstrapSent := false
 		lastPortfolioSig := ""
+		var lastState *traderState
+		var lastDailyHistory map[string]portfolioDayStats
 
 		for {
 			var snap runner.Snapshot
@@ -344,12 +348,14 @@ func main() {
                 "all_time_realized_pnl_usd": 0.0,
             }
 
-            if stateErr == nil {
+			if stateErr == nil {
+				lastState = &state
                 marketSection["polymarket_mid"] = state.PolymarketMid
                 marketSection["polymarket_probability"] = state.PolymarketProb
                 marketSection["fair_value_probability"] = state.FairValueProb
                 marketSection["binance_mid"] = state.BinanceMid
                 marketSection["ts_ms"] = state.TSMs
+				marketSection["quote_age_ms"] = state.OldestQuoteAgeMs
 
                 signalSection["edge_bps"] = state.EdgeBps
                 signalSection["net_edge_bps"] = state.NetEdgeBps
@@ -375,6 +381,43 @@ func main() {
                 portfolioSection["realized_pnl_usd"] = state.PortfolioRealizedPnL
                 portfolioSection["total_pnl_usd"] = state.PortfolioTotalPnL
                 portfolioSection["all_time_realized_pnl_usd"] = state.PortfolioAllTimeRealizedPnL
+				portfolioSection["drawdown_pct_from_peak"] = state.PortfolioDrawdownPctFromPeak
+				portfolioSection["source"] = "redis_live"
+			} else if lastState != nil {
+				marketSection["polymarket_mid"] = lastState.PolymarketMid
+				marketSection["polymarket_probability"] = lastState.PolymarketProb
+				marketSection["fair_value_probability"] = lastState.FairValueProb
+				marketSection["binance_mid"] = lastState.BinanceMid
+				marketSection["ts_ms"] = lastState.TSMs
+				marketSection["quote_age_ms"] = lastState.OldestQuoteAgeMs
+
+				signalSection["edge_bps"] = lastState.EdgeBps
+				signalSection["net_edge_bps"] = lastState.NetEdgeBps
+				signalSection["direction"] = lastState.Direction
+				signalSection["risk_allowed"] = lastState.RiskAllowed
+				signalSection["position_signal"] = lastState.PositionSignal
+				signalSection["entry_signal"] = lastState.EntrySignal
+				signalSection["exit_signal"] = lastState.ExitSignal
+				signalSection["close_reason"] = lastState.CloseReason
+
+				execSection["execution_status"] = lastState.ExecutionStatus
+				execSection["open_positions"] = lastState.OpenPositions
+				execSection["open_trades"] = lastState.OpenPositions
+				if lastState.OpenPositions > 0 {
+					lastTradeStatus = "open"
+				} else {
+					lastTradeStatus = "closed"
+				}
+				execSection["latest_trade_status"] = lastTradeStatus
+
+				portfolioSection["net_qty"] = lastState.PortfolioNetQty
+				portfolioSection["avg_entry"] = lastState.PortfolioAvgEntry
+				portfolioSection["unrealized_pnl_usd"] = lastState.PortfolioUnrealizedPnL
+				portfolioSection["realized_pnl_usd"] = lastState.PortfolioRealizedPnL
+				portfolioSection["total_pnl_usd"] = lastState.PortfolioTotalPnL
+				portfolioSection["all_time_realized_pnl_usd"] = lastState.PortfolioAllTimeRealizedPnL
+				portfolioSection["drawdown_pct_from_peak"] = lastState.PortfolioDrawdownPctFromPeak
+				portfolioSection["source"] = "redis_cached"
             } else {
                 marketSection["warning"] = "trader state unavailable in redis"
                 signalSection["warning"] = stateErr.Error()
@@ -382,8 +425,13 @@ func main() {
 
             history := make(map[string]portfolioDayStats)
             if err := readCachedJSONWithTimeout(r.Context(), cache, portfolioDailyKey, &history, 1200*time.Millisecond); err != nil {
-                portfolioSection["daily_history"] = map[string]portfolioDayStats{}
+                if lastDailyHistory != nil {
+                    portfolioSection["daily_history"] = lastDailyHistory
+                } else {
+                    portfolioSection["daily_history"] = map[string]portfolioDayStats{}
+                }
             } else {
+				lastDailyHistory = history
                 portfolioSection["daily_history"] = history
                 todayKey := time.Now().UTC().Format("2006-01-02")
                 if todayStats, ok := history[todayKey]; ok {

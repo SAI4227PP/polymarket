@@ -7,6 +7,8 @@ use crate::slippage::{apply_slippage, estimate_slippage_bps, SlippageModel};
 pub struct ExecutionConfig {
     pub base_qty: f64,
     pub edge_threshold_bps: f64,
+    pub min_net_edge_margin_bps: f64,
+    pub max_slippage_bps: f64,
     pub slippage_model: SlippageModel,
     pub demo_wallet_balance_usd: f64,
     pub min_order_notional_usd: f64,
@@ -18,6 +20,8 @@ impl Default for ExecutionConfig {
         Self {
             base_qty: 5.0,
             edge_threshold_bps: 5.0,
+            min_net_edge_margin_bps: 3.0,
+            max_slippage_bps: 80.0,
             slippage_model: SlippageModel::default(),
             demo_wallet_balance_usd: 10.0,
             min_order_notional_usd: 1.0,
@@ -42,6 +46,11 @@ pub fn build_order_intent(
         return None;
     }
 
+    let min_required_edge = cfg.edge_threshold_bps + cfg.min_net_edge_margin_bps.max(0.0);
+    if signal.net_edge_bps < min_required_edge {
+        return None;
+    }
+
     let scaled_qty = size_from_edge_bps(signal.net_edge_bps, cfg.base_qty, cfg.edge_threshold_bps);
     if scaled_qty <= 0.0 {
         return None;
@@ -62,6 +71,9 @@ pub fn build_order_intent(
         realized_vol_bps,
         cfg.slippage_model,
     );
+    if slippage_bps > cfg.max_slippage_bps.max(0.0) {
+        return None;
+    }
 
     let is_buy = signal.direction == TradeDirection::Up;
     let limit_price = apply_slippage(ref_price, slippage_bps, is_buy);
@@ -192,6 +204,46 @@ mod tests {
             cfg,
         );
 
+        assert!(intent.is_none());
+    }
+
+    #[test]
+    fn skips_when_net_edge_below_required_margin() {
+        let cfg = ExecutionConfig {
+            base_qty: 1.0,
+            edge_threshold_bps: 5.0,
+            min_net_edge_margin_bps: 5.0,
+            demo_wallet_balance_usd: 10.0,
+            min_order_notional_usd: 1.0,
+            min_order_shares: 0.5,
+            ..ExecutionConfig::default()
+        };
+
+        let weak_signal = Signal {
+            edge_bps: 20.0,
+            net_edge_bps: 8.0,
+            should_trade: true,
+            direction: TradeDirection::Up,
+        };
+
+        let intent = build_order_intent("BTC", &weak_signal, 0.57, 3.0, 5_000.0, 30.0, cfg);
+        assert!(intent.is_none());
+    }
+
+    #[test]
+    fn skips_when_estimated_slippage_exceeds_cap() {
+        let cfg = ExecutionConfig {
+            base_qty: 1.0,
+            edge_threshold_bps: 1.0,
+            min_net_edge_margin_bps: 0.0,
+            max_slippage_bps: 5.0,
+            demo_wallet_balance_usd: 10.0,
+            min_order_notional_usd: 1.0,
+            min_order_shares: 0.5,
+            ..ExecutionConfig::default()
+        };
+
+        let intent = build_order_intent("BTC", &signal_up(), 0.57, 10.0, 1.0, 200.0, cfg);
         assert!(intent.is_none());
     }
 }

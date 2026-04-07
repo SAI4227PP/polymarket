@@ -16,6 +16,11 @@ pub struct SignalConfig {
     pub alpha_half_life_ms: u64,
     pub regime_vol_bps: f64,
     pub target_notional_usd: f64,
+    pub no_trade_band_bps: f64,
+    pub max_model_market_divergence_bps: f64,
+    pub divergence_penalty_bps_per_100: f64,
+    pub min_liquidity_score: f64,
+    pub direction_mismatch_penalty_bps: f64,
 }
 
 impl Default for SignalConfig {
@@ -32,11 +37,25 @@ impl Default for SignalConfig {
             alpha_half_life_ms: 1_500,
             regime_vol_bps: 40.0,
             target_notional_usd: 100.0,
+            no_trade_band_bps: 20.0,
+            max_model_market_divergence_bps: 450.0,
+            divergence_penalty_bps_per_100: 2.5,
+            min_liquidity_score: 0.15,
+            direction_mismatch_penalty_bps: 8.0,
         }
     }
 }
 
 pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
+    if !(pm.price.is_finite() && bn.price.is_finite()) || bn.price <= 0.0 {
+        return Signal {
+            edge_bps: 0.0,
+            net_edge_bps: 0.0,
+            should_trade: false,
+            direction: TradeDirection::Flat,
+        };
+    }
+
     let model_fv = fair_value_with_basis(bn, cfg.basis_bps, cfg.anchor_price);
     let market_fv = pm.price;
 
@@ -78,6 +97,16 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
     let vol_penalty = (cfg.regime_vol_bps / 100.0).clamp(0.0, 10.0);
     net_edge_bps -= spread_penalty + age_penalty + vol_penalty;
 
+    let model_side = side_from_prob(model_fv, cfg.no_trade_band_bps);
+    let market_side = side_from_prob(pm.price, cfg.no_trade_band_bps);
+    if model_side != 0 && market_side != 0 && model_side != market_side {
+        net_edge_bps -= cfg.direction_mismatch_penalty_bps.max(0.0);
+    }
+
+    let divergence_bps = (model_fv - pm.price).abs() * 10_000.0;
+    let divergence_over_100 = (divergence_bps / 100.0).max(0.0);
+    net_edge_bps -= divergence_over_100 * cfg.divergence_penalty_bps_per_100.max(0.0);
+
     let direction = if gross_edge_bps_signed > 0.0 {
         TradeDirection::Up
     } else if gross_edge_bps_signed < 0.0 {
@@ -87,12 +116,31 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
     };
 
     let adaptive_threshold = cfg.min_edge_bps + (pm_spread + bn_spread) * 0.15 + vol_penalty;
+    let no_trade_band = model_side == 0 && market_side == 0;
+    let stale_divergence = divergence_bps > cfg.max_model_market_divergence_bps.max(0.0);
+    let too_thin_liquidity = liquidity_score < cfg.min_liquidity_score.clamp(0.0, 1.0);
 
     Signal {
         edge_bps: gross_edge_bps_signed,
         net_edge_bps,
-        should_trade: net_edge_bps >= adaptive_threshold && direction != TradeDirection::Flat,
+        should_trade: net_edge_bps >= adaptive_threshold
+            && direction != TradeDirection::Flat
+            && !no_trade_band
+            && !stale_divergence
+            && !too_thin_liquidity,
         direction,
+    }
+}
+
+fn side_from_prob(prob: f64, no_trade_band_bps: f64) -> i8 {
+    let center_bps = (prob - 0.5) * 10_000.0;
+    let band = no_trade_band_bps.max(0.0);
+    if center_bps > band {
+        1
+    } else if center_bps < -band {
+        -1
+    } else {
+        0
     }
 }
 

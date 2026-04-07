@@ -9,7 +9,7 @@ use portfolio_engine::positions::{update_position, Position};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use risk_engine::kill_switch::{should_kill, KillSwitchConfig, KillSwitchState};
 use risk_engine::limits::{evaluate_trade, RiskInput, RiskLimits};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use strategy_engine::signals::{compute_signal, SignalConfig};
 use std::collections::HashMap;
@@ -28,7 +28,7 @@ struct PendingPosition {
     expected_pnl_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OpenTrade {
     id: String,
     pair: String,
@@ -43,7 +43,7 @@ struct OpenTrade {
     expected_pnl_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CompletedTrade {
     id: String,
     pair: String,
@@ -62,6 +62,17 @@ struct CompletedTrade {
     exit_ts_ms: u64,
     duration_ms: u64,
     outcome: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct TraderStateSnapshot {
+    ts_ms: u64,
+    day_pnl_usd: f64,
+    portfolio_realized_pnl_usd: f64,
+    portfolio_total_pnl_usd: f64,
+    portfolio_all_time_realized_pnl_usd: f64,
+    portfolio_drawdown_pct_from_peak: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,7 +108,7 @@ struct TraderState {
 async fn main() -> Result<()> {
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
     let mode = std::env::var("MODE").unwrap_or_else(|_| "paper".to_string());
-    let is_paper_mode = mode.eq_ignore_ascii_case("paper");
+    let is_live_mode = mode.eq_ignore_ascii_case("live");
 
     let loop_ms = env_u64("LOOP_INTERVAL_MS", 1_000);
     let min_edge_bps = env_f64("MIN_EDGE_BPS", 8.0);
@@ -120,7 +131,7 @@ async fn main() -> Result<()> {
     let configured_event_slug = std::env::var("POLYMARKET_EVENT_SLUG").unwrap_or_default();
     let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
 
-    let signal_cfg = SignalConfig {
+    let base_signal_cfg = SignalConfig {
         min_edge_bps,
         anchor_price: env_f64("BINANCE_ANCHOR_PRICE", 100_000.0),
         basis_bps: env_f64("BINANCE_BASIS_BPS", 0.0),
@@ -130,12 +141,21 @@ async fn main() -> Result<()> {
     };
 
     let risk_limits = RiskLimits {
-        max_notional_usd: env_f64("MAX_NOTIONAL_USD", if is_paper_mode { 5.0 } else { 10.0 }),
-        max_daily_loss_usd: env_f64("MAX_DAILY_LOSS_USD", if is_paper_mode { 20.0 } else { 100.0 }),
-        max_open_positions: env_u64("MAX_OPEN_POSITIONS", if is_paper_mode { 1 } else { 3 }) as usize,
-        max_leverage: env_f64("MAX_LEVERAGE", if is_paper_mode { 1.5 } else { 2.5 }),
-        max_var_budget_usd: env_f64("MAX_VAR_BUDGET_USD", if is_paper_mode { 50.0 } else { 150.0 }),
+        max_notional_usd: env_f64("MAX_NOTIONAL_USD", 10.0),
+        max_daily_loss_usd: env_f64("MAX_DAILY_LOSS_USD", 100.0),
+        max_open_positions: env_u64("MAX_OPEN_POSITIONS", 3) as usize,
+        max_leverage: env_f64("MAX_LEVERAGE", 2.5),
+        max_var_budget_usd: env_f64("MAX_VAR_BUDGET_USD", 150.0),
         max_concentration_ratio: env_f64("MAX_CONCENTRATION_RATIO", 0.5),
+    };
+
+    let runtime_wallet_balance_usd = if is_live_mode {
+        env_f64(
+            "LIVE_WALLET_BALANCE_USD",
+            env_f64("ACCOUNT_EQUITY_USD", 10.0),
+        )
+    } else {
+        env_f64("DEMO_WALLET_BALANCE_USD", 10.0)
     };
 
     let kill_cfg = KillSwitchConfig {
@@ -147,7 +167,9 @@ async fn main() -> Result<()> {
     let execution_cfg = ExecutionConfig {
         base_qty: env_f64("ORDER_QTY", 5.0),
         edge_threshold_bps: env_f64("EXECUTION_EDGE_THRESHOLD_BPS", 5.0),
-        demo_wallet_balance_usd: env_f64("DEMO_WALLET_BALANCE_USD", 10.0),
+        min_net_edge_margin_bps: env_f64("EXECUTION_MIN_NET_EDGE_MARGIN_BPS", 3.0),
+        max_slippage_bps: env_f64("EXECUTION_MAX_SLIPPAGE_BPS", 80.0),
+        demo_wallet_balance_usd: runtime_wallet_balance_usd,
         min_order_notional_usd: env_f64("MIN_ORDER_NOTIONAL_USD", 1.0),
         min_order_shares: env_f64("MIN_ORDER_SHARES", 5.0),
         ..ExecutionConfig::default()
@@ -185,12 +207,82 @@ async fn main() -> Result<()> {
             HashMap::new()
         }
     };
+    let last_trader_state = match load_trader_state_from_redis(
+        &redis_url,
+        &redis_state_key,
+        &mut redis_conn,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("redis trader-state load error: {err:#}");
+            None
+        }
+    };
+
+    let recovered_open_trades = match load_open_trades_from_redis(
+        &redis_url,
+        &redis_open_trades_key,
+        &mut redis_conn,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("redis open-trades load error: {err:#}");
+            Vec::new()
+        }
+    };
+    pending_positions = recovered_open_trades
+        .into_iter()
+        .filter_map(|t| pending_position_from_open_trade(t))
+        .collect();
+
+    trade_history = match load_trade_history_from_redis(
+        &redis_url,
+        &redis_final_trades_key,
+        &mut redis_conn,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("redis trade-history load error: {err:#}");
+            Vec::new()
+        }
+    };
+    trim_history(&mut trade_history, trade_history_limit);
+
+    if let Some(state) = last_trader_state.as_ref() {
+        portfolio_realized_pnl_usd = state
+            .portfolio_all_time_realized_pnl_usd
+            .max(state.portfolio_realized_pnl_usd);
+    }
+
+    let today_key = utc_day_string(now_ms());
+    if let Some(today_stats) = portfolio_daily_history.get(&today_key) {
+        day_pnl_usd = today_stats.day_pnl_usd;
+    } else if let Some(state) = last_trader_state.as_ref() {
+        if utc_day_string(state.ts_ms) == today_key {
+            day_pnl_usd = state.day_pnl_usd;
+        }
+    }
+
     let mut last_past_probability: Option<f64> = None;
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
+    let mut current_5m_bucket_start_ms: Option<u64> = None;
+    let mut current_5m_anchor_price = base_signal_cfg.anchor_price;
     let min_peak_pnl_for_drawdown_pct = env_f64("KILL_SWITCH_MIN_PEAK_PNL_USD", 5.0).max(0.0);
-    let mut peak_total_pnl_usd = 0.0_f64;
-    let mut current_drawdown_pct = 0.0_f64;
+    let mut peak_total_pnl_usd = last_trader_state
+        .as_ref()
+        .map(|s| s.portfolio_total_pnl_usd)
+        .unwrap_or(0.0);
+    let mut current_drawdown_pct = last_trader_state
+        .as_ref()
+        .map(|s| s.portfolio_drawdown_pct_from_peak)
+        .unwrap_or(0.0);
     let mut last_mark_price: Option<f64> = None;
     let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
 
@@ -224,6 +316,21 @@ async fn main() -> Result<()> {
         ticker.tick().await;
         let pm_snapshot = pm_rx.borrow().clone();
         let bn_snapshot = bn_rx.borrow().clone();
+        if let Some(bnq) = bn_snapshot.as_ref() {
+            let bucket = five_min_bucket_start_ms(bnq.ts_ms);
+            if current_5m_bucket_start_ms != Some(bucket) {
+                current_5m_bucket_start_ms = Some(bucket);
+                if bnq.price.is_finite() && bnq.price > 0.0 {
+                    current_5m_anchor_price = bnq.price;
+                }
+            }
+        }
+
+        let signal_cfg = SignalConfig {
+            anchor_price: current_5m_anchor_price,
+            ..base_signal_cfg
+        };
+
         if let Some(q) = pm_snapshot.as_ref() {
             if q.venue == "polymarket-past-results" {
                 last_past_probability = Some(q.price.clamp(0.0, 1.0));
@@ -566,6 +673,8 @@ async fn run_iteration(
             .unwrap_or(false);
 
     let top_book_liquidity_usd = env_f64("TOP_BOOK_LIQUIDITY_USD", 5_000.0);
+    let no_entry_first_seconds_5m = env_u64("NO_ENTRY_FIRST_SECONDS_5M", 3).min(120);
+    let blocked_first_seconds_5m = is_first_seconds_of_five_min_window(now, no_entry_first_seconds_5m);
     let no_entry_last_seconds_5m = env_u64("NO_ENTRY_LAST_SECONDS_5M", 15).min(299);
     let blocked_last_seconds_5m = is_last_seconds_of_five_min_window(now, no_entry_last_seconds_5m);
     let risk_capped_notional_usd = capped_entry_notional_usd(
@@ -576,7 +685,12 @@ async fn run_iteration(
     );
 
     let can_open_new_position = !has_open_positions;
-    let candidate_intent = if can_open_new_position && pm_fresh && bn_fresh && !blocked_last_seconds_5m {
+    let candidate_intent = if can_open_new_position
+        && pm_fresh
+        && bn_fresh
+        && !blocked_first_seconds_5m
+        && !blocked_last_seconds_5m
+    {
         order_manager::build_order_intent(
             "BTC",
             &signal,
@@ -629,7 +743,12 @@ async fn run_iteration(
         .map(|o| o.quantity * o.limit_price)
         .unwrap_or(0.0);
     let mut report = order_manager::submit_if_needed(intent);
-    if !report.accepted && can_open_new_position && blocked_last_seconds_5m {
+    if !report.accepted && can_open_new_position && blocked_first_seconds_5m {
+        report.status = format!(
+            "skipped:first_seconds_5m_guard elapsed_s<{}",
+            no_entry_first_seconds_5m
+        );
+    } else if !report.accepted && can_open_new_position && blocked_last_seconds_5m {
         report.status = format!(
             "skipped:last_seconds_5m_guard remaining_s<={}",
             no_entry_last_seconds_5m
@@ -725,6 +844,8 @@ async fn run_iteration(
         "hold_stale_polymarket"
     } else if !bn_fresh {
         "hold_stale_binance_depth"
+    } else if blocked_first_seconds_5m && can_open_new_position {
+        "hold_first_seconds_5m_guard"
     } else if blocked_last_seconds_5m && can_open_new_position {
         "hold_last_seconds_5m_guard"
     } else if has_open_positions && strong_win_zone {
@@ -850,6 +971,129 @@ async fn load_portfolio_daily_from_redis(
         Ok(HashMap::new())
     }
 }
+
+async fn load_trader_state_from_redis(
+    redis_url: &str,
+    key: &str,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<Option<TraderStateSnapshot>> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    if let Some(c) = conn.as_mut() {
+        let get_res: redis::RedisResult<Option<String>> = c.get(key).await;
+        match get_res {
+            Ok(Some(raw)) => {
+                let parsed = serde_json::from_str::<TraderStateSnapshot>(&raw)
+                    .context("deserialize trader state snapshot")?;
+                Ok(Some(parsed))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => {
+                *conn = None;
+                Err(anyhow!("redis get trader state failed: {e}"))
+            }
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+async fn load_open_trades_from_redis(
+    redis_url: &str,
+    key: &str,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<Vec<OpenTrade>> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    if let Some(c) = conn.as_mut() {
+        let get_res: redis::RedisResult<Option<String>> = c.get(key).await;
+        match get_res {
+            Ok(Some(raw)) => {
+                let parsed = serde_json::from_str::<Vec<OpenTrade>>(&raw)
+                    .context("deserialize open trades snapshot")?;
+                Ok(parsed)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => {
+                *conn = None;
+                Err(anyhow!("redis get open trades failed: {e}"))
+            }
+        }
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+async fn load_trade_history_from_redis(
+    redis_url: &str,
+    key: &str,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<Vec<CompletedTrade>> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    if let Some(c) = conn.as_mut() {
+        let get_res: redis::RedisResult<Option<String>> = c.get(key).await;
+        match get_res {
+            Ok(Some(raw)) => {
+                let parsed = serde_json::from_str::<Vec<CompletedTrade>>(&raw)
+                    .context("deserialize trade-history snapshot")?;
+                Ok(parsed)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => {
+                *conn = None;
+                Err(anyhow!("redis get trade-history failed: {e}"))
+            }
+        }
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn pending_position_from_open_trade(t: OpenTrade) -> Option<PendingPosition> {
+    let direction = parse_trade_direction(&t.direction)?;
+    Some(PendingPosition {
+        id: t.id,
+        direction,
+        quantity: t.quantity,
+        entry_price: t.entry_price,
+        entry_notional_usd: t.entry_notional_usd,
+        entry_ts_ms: t.entry_ts_ms,
+        settle_at_ms: t.settle_at_ms,
+        expected_pnl_usd: t.expected_pnl_usd,
+    })
+}
+
+fn parse_trade_direction(v: &str) -> Option<TradeDirection> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "up" => Some(TradeDirection::Up),
+        "down" => Some(TradeDirection::Down),
+        "flat" => Some(TradeDirection::Flat),
+        _ => None,
+    }
+}
+
 async fn publish_state_to_redis(
     redis_url: &str,
     key: &str,
@@ -1401,6 +1645,22 @@ fn is_last_seconds_of_five_min_window(now_ms: u64, block_last_seconds: u64) -> b
     elapsed_in_window >= (window_ms - block_ms)
 }
 
+fn is_first_seconds_of_five_min_window(now_ms: u64, block_first_seconds: u64) -> bool {
+    if block_first_seconds == 0 {
+        return false;
+    }
+
+    let window_ms = 5 * 60 * 1000;
+    let block_ms = block_first_seconds.saturating_mul(1_000).min(window_ms - 1);
+    let elapsed_in_window = now_ms % window_ms;
+    elapsed_in_window < block_ms
+}
+
+fn five_min_bucket_start_ms(ts_ms: u64) -> u64 {
+    let window_ms = 5 * 60 * 1000;
+    ts_ms - (ts_ms % window_ms)
+}
+
 fn utc_day_string(ts_ms: u64) -> String {
     let days_since_epoch = (ts_ms / 1_000 / 86_400) as i64;
     let (year, month, day) = civil_from_days(days_since_epoch);
@@ -1768,6 +2028,19 @@ mod tests {
         let window_ms = 5 * 60 * 1000;
         assert!(!is_last_seconds_of_five_min_window(window_ms - 16_000, 15));
         assert!(is_last_seconds_of_five_min_window(window_ms - 10_000, 15));
+    }
+
+    #[test]
+    fn detects_first_seconds_of_five_min_window() {
+        assert!(is_first_seconds_of_five_min_window(2_000, 3));
+        assert!(!is_first_seconds_of_five_min_window(4_000, 3));
+    }
+
+    #[test]
+    fn rounds_to_five_min_bucket_start() {
+        assert_eq!(five_min_bucket_start_ms(302_345), 300_000);
+        assert_eq!(five_min_bucket_start_ms(599_999), 300_000);
+        assert_eq!(five_min_bucket_start_ms(600_000), 600_000);
     }
 }
 

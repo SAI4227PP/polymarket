@@ -14,11 +14,6 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
 }
 
 $env:MODE = "paper"
-$env:MAX_OPEN_POSITIONS = "1"
-$env:MAX_NOTIONAL_USD = "5"
-$env:MAX_DAILY_LOSS_USD = "20"
-$env:MAX_LEVERAGE = "1.5"
-$env:MAX_VAR_BUDGET_USD = "50"
 
 Push-Location "$PSScriptRoot\..\rust-core"
 $trader = Start-Process -FilePath "cargo" -ArgumentList "run -p trader" -PassThru -NoNewWindow
