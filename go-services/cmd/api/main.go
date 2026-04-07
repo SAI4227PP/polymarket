@@ -198,15 +198,15 @@ func main() {
 	mux.HandleFunc("/trades", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntBounded(r, "limit", 50, 5000)
 
-		var trades []map[string]interface{}
-		if err := readCachedJSONWithTimeout(r.Context(), cache, openTradesKey, &trades, 1200*time.Millisecond); err != nil {
+		var openTrades []map[string]interface{}
+		if err := readCachedJSONWithTimeout(r.Context(), cache, openTradesKey, &openTrades, 1200*time.Millisecond); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		if limit > 0 && len(trades) > limit {
-			trades = trades[:limit]
+		if limit > 0 && len(openTrades) > limit {
+			openTrades = openTrades[:limit]
 		}
-		writeJSON(w, http.StatusOK, trades)
+		writeJSON(w, http.StatusOK, openTrades)
 	})
 
 	mux.HandleFunc("/trades/completed", func(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +368,6 @@ func main() {
                 execSection["execution_status"] = state.ExecutionStatus
                 execSection["open_positions"] = state.OpenPositions
                 execSection["open_trades"] = state.OpenPositions
-                execSection["day_pnl_usd"] = state.DayPnlUSD
                 portfolioSection["net_qty"] = state.PortfolioNetQty
                 portfolioSection["avg_entry"] = state.PortfolioAvgEntry
                 portfolioSection["unrealized_pnl_usd"] = state.PortfolioUnrealizedPnL
@@ -394,9 +393,24 @@ func main() {
                     portfolioSection["today_stats"] = todayStats
                 }
             }
+            execSection["day_pnl_usd"] = portfolioSection["day_pnl_usd"]
 			runningTradesSig := payloadSignature(runningTradesPayload)
 			completedTradesSig := payloadSignature(completedTradesPayload)
 			portfolioSig := payloadSignature(portfolioSection)
+			snapshotData := map[string]interface{}{
+				"generated_at":     snap.GeneratedAt,
+				"config":           snap.Config,
+				"report":           snap.Report,
+				"metrics":          snap.Metrics,
+				"market":           marketSection,
+				"signal":           signalSection,
+				"execution":        execSection,
+				"portfolio":        portfolioSection,
+				"trades":           runningTradesPayload,
+				"completed_trades": completedTradesPayload,
+				"live_btc":         liveBTCPayload,
+				"past_outcomes":    pastOutcomesPayload,
+			}
 			now := time.Now().UTC()
 			events := make([]streamEnvelope, 0, 10)
 			if !initialBootstrapSent {
@@ -404,7 +418,7 @@ func main() {
 					streamEnvelope{
 						Type:      "snapshot",
 						Timestamp: now,
-						Data:      snap,
+						Data:      snapshotData,
 					},
 					streamEnvelope{
 						Type:      "portfolio",
@@ -795,6 +809,5 @@ func payloadSignature(v interface{}) string {
 	}
 	return string(b)
 }
-
 
 

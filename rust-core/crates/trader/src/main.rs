@@ -189,6 +189,19 @@ async fn main() -> Result<()> {
     let mut oldest_quote_age_ms = 0u64;
     let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
 
+    let initial_open_trades_payload = build_open_trades(&pending_positions);
+    if let Err(err) = publish_open_trades_to_redis(
+        &redis_url,
+        &redis_open_trades_key,
+        &initial_open_trades_payload,
+        &mut redis_conn,
+    )
+    .await
+    {
+        eprintln!("redis open-trades initial publish error: {err:#}");
+    }
+
+
     loop {
         ticker.tick().await;
         let pm_snapshot = pm_rx.borrow().clone();
@@ -325,17 +338,6 @@ async fn main() -> Result<()> {
                     eprintln!("redis publish error: {err:#}");
                 }
 
-                let open_trades_payload = build_open_trades(&pending_positions);
-                if let Err(err) = publish_open_trades_to_redis(
-                    &redis_url,
-                    &redis_open_trades_key,
-                    &open_trades_payload,
-                    &mut redis_conn,
-                )
-                .await
-                {
-                    eprintln!("redis open-trades publish error: {err:#}");
-                }
 
                 if let Err(err) = publish_trades_to_redis(
                     &redis_url,
@@ -366,6 +368,19 @@ async fn main() -> Result<()> {
                 error_streak = error_streak.saturating_add(1);
                 eprintln!("iteration error: {err:#}");
             }
+        }
+
+
+        let open_trades_payload = build_open_trades(&pending_positions);
+        if let Err(err) = publish_open_trades_to_redis(
+            &redis_url,
+            &redis_open_trades_key,
+            &open_trades_payload,
+            &mut redis_conn,
+        )
+        .await
+        {
+            eprintln!("redis open-trades publish error: {err:#}");
         }
 
         if should_kill(
