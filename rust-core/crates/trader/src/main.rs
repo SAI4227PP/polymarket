@@ -29,6 +29,21 @@ struct PendingPosition {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct OpenTrade {
+    id: String,
+    pair: String,
+    direction: String,
+    entry_side: String,
+    quantity: f64,
+    entry_price: f64,
+    entry_probability: f64,
+    entry_notional_usd: f64,
+    entry_ts_ms: u64,
+    settle_at_ms: u64,
+    expected_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CompletedTrade {
     id: String,
     pair: String,
@@ -91,6 +106,8 @@ async fn main() -> Result<()> {
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let redis_state_key = std::env::var("REDIS_TRADER_STATE_KEY")
         .unwrap_or_else(|_| "trader:state:latest".to_string());
+    let redis_open_trades_key = std::env::var("REDIS_OPEN_TRADES_KEY")
+        .unwrap_or_else(|_| "trader:open_trades:latest".to_string());
     let redis_final_trades_key = std::env::var("REDIS_FINAL_TRADES_KEY")
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
     let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
@@ -306,6 +323,18 @@ async fn main() -> Result<()> {
                 .await
                 {
                     eprintln!("redis publish error: {err:#}");
+                }
+
+                let open_trades_payload = build_open_trades(&pending_positions);
+                if let Err(err) = publish_open_trades_to_redis(
+                    &redis_url,
+                    &redis_open_trades_key,
+                    &open_trades_payload,
+                    &mut redis_conn,
+                )
+                .await
+                {
+                    eprintln!("redis open-trades publish error: {err:#}");
                 }
 
                 if let Err(err) = publish_trades_to_redis(
@@ -778,6 +807,34 @@ async fn publish_trades_to_redis(
 }
 
 
+async fn publish_open_trades_to_redis(
+    redis_url: &str,
+    key: &str,
+    trades: &[OpenTrade],
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    let payload = serde_json::to_string(trades).context("serialize open trades")?;
+
+    if let Some(c) = conn.as_mut() {
+        let set_res: redis::RedisResult<()> = c.set(key, payload).await;
+        if let Err(e) = set_res {
+            *conn = None;
+            return Err(anyhow!("redis set open trades failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
+
 async fn publish_portfolio_daily_to_redis(
     redis_url: &str,
     key: &str,
@@ -898,6 +955,32 @@ fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
         portfolio_total_pnl_usd: day_pnl_usd,
         portfolio_all_time_realized_pnl_usd: 0.0,
     }
+}
+
+fn build_open_trades(pending_positions: &[PendingPosition]) -> Vec<OpenTrade> {
+    pending_positions
+        .iter()
+        .map(|p| {
+            let (direction, entry_side) = match p.direction {
+                TradeDirection::Up => ("Up".to_string(), "buy".to_string()),
+                TradeDirection::Down => ("Down".to_string(), "sell".to_string()),
+                TradeDirection::Flat => ("Flat".to_string(), "none".to_string()),
+            };
+            OpenTrade {
+                id: p.id.clone(),
+                pair: "BTC".to_string(),
+                direction,
+                entry_side,
+                quantity: p.quantity,
+                entry_price: p.entry_price,
+                entry_probability: p.entry_price,
+                entry_notional_usd: p.entry_notional_usd,
+                entry_ts_ms: p.entry_ts_ms,
+                settle_at_ms: p.settle_at_ms,
+                expected_pnl_usd: p.expected_pnl_usd,
+            }
+        })
+        .collect()
 }
 
 fn spawn_binance_stream(symbol: String, tx: watch::Sender<Option<Quote>>) {
@@ -1574,4 +1657,9 @@ mod tests {
         assert!(is_last_seconds_of_five_min_window(window_ms - 10_000, 15));
     }
 }
+
+
+
+
+
 

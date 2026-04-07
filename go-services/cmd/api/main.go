@@ -107,7 +107,8 @@ func main() {
 	snapshotKey := getenv("REDIS_SNAPSHOT_KEY", "api:snapshot:latest")
 	statusKey := getenv("REDIS_STATUS_KEY", "api:status:latest")
 	metricsKey := getenv("REDIS_METRICS_KEY", "api:metrics:latest")
-	tradesKey := getenv("REDIS_TRADES_KEY", "api:trades:latest")
+	runnerTradesKey := getenv("REDIS_TRADES_KEY", "api:trades:latest")
+	openTradesKey := getenv("REDIS_OPEN_TRADES_KEY", "trader:open_trades:latest")
 	configKey := getenv("REDIS_CONFIG_KEY", "api:config:latest")
 	traderStateKey := getenv("REDIS_TRADER_STATE_KEY", "trader:state:latest")
 	finalTradesKey := getenv("REDIS_FINAL_TRADES_KEY", "trader:trades:latest")
@@ -148,11 +149,11 @@ func main() {
         defer pgClient.Close()
     }
 
-	go refreshRedisCache(logger, svc, cache, snapshotKey, statusKey, metricsKey, tradesKey, configKey)
+	go refreshRedisCache(logger, svc, cache, snapshotKey, statusKey, metricsKey, runnerTradesKey, configKey)
     if pgClient != nil {
         go syncPortfolioDailyToPostgres(logger, cache, pgClient, portfolioDailyKey)
         go syncTradeRecordsToPostgres(logger, cache, pgClient, finalTradesKey)
-        go syncTradeSnapshotsToPostgres(logger, cache, pgClient, tradesKey, finalTradesKey)
+        go syncTradeSnapshotsToPostgres(logger, cache, pgClient, openTradesKey, finalTradesKey)
     }
 
 	mux := http.NewServeMux()
@@ -197,13 +198,11 @@ func main() {
 	mux.HandleFunc("/trades", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntBounded(r, "limit", 50, 5000)
 
-		var trades []storage.TradeRecord
-		if err := readCachedJSONWithTimeout(r.Context(), cache, tradesKey, &trades, 1200*time.Millisecond); err != nil {
+		var trades []map[string]interface{}
+		if err := readCachedJSONWithTimeout(r.Context(), cache, openTradesKey, &trades, 1200*time.Millisecond); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
 			return
 		}
-		statusFilter := storage.TradeStatus(strings.TrimSpace(r.URL.Query().Get("status")))
-		trades = filterTrades(trades, statusFilter)
 		if limit > 0 && len(trades) > limit {
 			trades = trades[:limit]
 		}
@@ -275,7 +274,12 @@ func main() {
 
 			var state traderState
 			stateErr := readCachedJSONWithTimeout(r.Context(), cache, traderStateKey, &state, 1500*time.Millisecond)
-            runningTradesPayload := interface{}(snap.Trades)
+            var runningTrades []map[string]interface{}
+            runningTradesErr := readCachedJSONWithTimeout(r.Context(), cache, openTradesKey, &runningTrades, 1200*time.Millisecond)
+            runningTradesPayload := interface{}(runningTrades)
+            if runningTradesErr != nil {
+                runningTradesPayload = interface{}([]map[string]interface{}{})
+            }
             var finalTrades []completedTrade
             finalTradesErr := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond)
             completedTradesPayload := interface{}(finalTrades)
@@ -665,7 +669,7 @@ func syncTradeSnapshotsToPostgres(
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
-		runningTrades := make([]storage.TradeRecord, 0)
+		runningTrades := make([]map[string]interface{}, 0)
 		if err := cache.GetJSON(ctx, runningTradesKey, &runningTrades); err != nil && !errors.Is(err, redis.Nil) {
 			logger.Warn("postgres sync running trades snapshot read failed", map[string]interface{}{"error": err.Error()})
 		}
