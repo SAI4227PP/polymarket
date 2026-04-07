@@ -201,6 +201,19 @@ async fn main() -> Result<()> {
         eprintln!("redis open-trades initial publish error: {err:#}");
     }
 
+    if let Err(err) = publish_trades_to_redis(
+        &redis_url,
+        &redis_final_trades_key,
+        &trade_history,
+        &mut redis_conn,
+    )
+    .await
+    {
+        eprintln!("redis trade-history initial publish error: {err:#}");
+    }
+
+
+
 
     loop {
         ticker.tick().await;
@@ -339,16 +352,6 @@ async fn main() -> Result<()> {
                 }
 
 
-                if let Err(err) = publish_trades_to_redis(
-                    &redis_url,
-                    &redis_final_trades_key,
-                    &trade_history,
-                    &mut redis_conn,
-                )
-                .await
-                {
-                    eprintln!("redis trade-history publish error: {err:#}");
-                }
                 if let Err(err) = publish_aux_stream_payloads_to_redis(
                     &redis_url,
                     &redis_live_btc_key,
@@ -382,6 +385,18 @@ async fn main() -> Result<()> {
         {
             eprintln!("redis open-trades publish error: {err:#}");
         }
+
+        if let Err(err) = publish_trades_to_redis(
+            &redis_url,
+            &redis_final_trades_key,
+            &trade_history,
+            &mut redis_conn,
+        )
+        .await
+        {
+            eprintln!("redis trade-history publish error: {err:#}");
+        }
+
 
         if should_kill(
             KillSwitchState {
