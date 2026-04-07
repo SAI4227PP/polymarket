@@ -68,19 +68,7 @@ type completedTrade struct {
 type streamEnvelope struct {
 	Type      string      `json:"type"`
 	Timestamp time.Time   `json:"timestamp"`
-	Data      streamFrame `json:"data"`
-}
-
-type streamFrame struct {
-	Snapshot      runner.Snapshot        `json:"snapshot"`
-	Trades        interface{}            `json:"trades"`
-	TradeComplete interface{}            `json:"trade_complete"`
-	LiveBTC       interface{}            `json:"live_btc"`
-	PastOutcomes  interface{}            `json:"past_outcomes"`
-	Market        map[string]interface{} `json:"market"`
-	Signal        map[string]interface{} `json:"signal"`
-	Execution     map[string]interface{} `json:"execution"`
-	Portfolio     map[string]interface{} `json:"portfolio"`
+	Data      interface{} `json:"data"`
 }
 
 type portfolioDayStats struct {
@@ -260,6 +248,9 @@ func main() {
 		intervalMs := queryIntBounded(r, "interval_ms", 1000, 60000)
 		ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 		defer ticker.Stop()
+		initialBootstrapSent := false
+		lastTradesSig := ""
+		lastTradeCompleteSig := ""
 
 		for {
 			var snap runner.Snapshot
@@ -295,7 +286,7 @@ func main() {
                 _ = conn.WriteJSON(streamEnvelope{
                     Type:      "error",
                     Timestamp: time.Now().UTC(),
-                    Data: streamFrame{Signal: map[string]interface{}{"message": snapErr.Error()}},
+                    Data:      map[string]interface{}{"message": snapErr.Error()},
                 })
                 select {
                 case <-r.Context().Done():
@@ -387,26 +378,91 @@ func main() {
                     portfolioSection["today_stats"] = todayStats
                 }
             }
-			env := streamEnvelope{
-				Type:      "snapshot",
-				Timestamp: time.Now().UTC(),
-				Data: streamFrame{
-					Snapshot:      snap,
-					Trades:        tradesPayload,
-					TradeComplete: tradeCompletePayload,
-					LiveBTC:       liveBTCPayload,
-					PastOutcomes:  pastOutcomesPayload,
-					Market:       marketSection,
-					Signal:       signalSection,
-					Execution:    execSection,
-					Portfolio:    portfolioSection,
+			tradesSig := payloadSignature(tradesPayload)
+			tradeCompleteSig := payloadSignature(tradeCompletePayload)
+			now := time.Now().UTC()
+			events := make([]streamEnvelope, 0, 8)
+			if !initialBootstrapSent {
+				events = append(events,
+					streamEnvelope{
+						Type:      "snapshot",
+						Timestamp: now,
+						Data:      snap,
+					},
+					streamEnvelope{
+						Type:      "portfolio",
+						Timestamp: now,
+						Data:      portfolioSection,
+					},
+					streamEnvelope{
+						Type:      "trades",
+						Timestamp: now,
+						Data:      tradesPayload,
+					},
+				)
+			}
+			events = append(events,
+				streamEnvelope{
+					Type:      "market",
+					Timestamp: now,
+					Data:      marketSection,
 				},
+				streamEnvelope{
+					Type:      "signal",
+					Timestamp: now,
+					Data:      signalSection,
+				},
+				streamEnvelope{
+					Type:      "execution",
+					Timestamp: now,
+					Data:      execSection,
+				},
+                streamEnvelope{
+                    Type:      "live_btc",
+                    Timestamp: now,
+                    Data:      liveBTCPayload,
+                },
+                streamEnvelope{
+                    Type:      "past_outcomes",
+                    Timestamp: now,
+                    Data:      pastOutcomesPayload,
+                },
+			)
+			tradeClosed := initialBootstrapSent && tradeCompleteSig != "" && tradeCompleteSig != lastTradeCompleteSig
+			if tradeClosed {
+				events = append(events,
+					streamEnvelope{
+						Type:      "trade_complete",
+						Timestamp: now,
+						Data:      tradeCompletePayload,
+					},
+					streamEnvelope{
+						Type:      "portfolio",
+						Timestamp: now,
+						Data:      portfolioSection,
+					},
+					streamEnvelope{
+						Type:      "trades",
+						Timestamp: now,
+						Data:      tradesPayload,
+					},
+				)
+			} else if initialBootstrapSent && tradesSig != lastTradesSig {
+				events = append(events, streamEnvelope{
+					Type:      "trades",
+					Timestamp: now,
+					Data:      tradesPayload,
+				})
 			}
-
-			if err := conn.WriteJSON(env); err != nil {
-				logger.Warn("websocket client disconnected", map[string]interface{}{"error": err.Error()})
-				return
+			for _, env := range events {
+				if err := conn.WriteJSON(env); err != nil {
+					logger.Warn("websocket client disconnected", map[string]interface{}{"error": err.Error(), "event_type": env.Type})
+					return
+				}
 			}
+			initialBootstrapSent = true
+			lastTradesSig = tradesSig
+			lastTradeCompleteSig = tradeCompleteSig
 
 			select {
 			case <-r.Context().Done():
@@ -655,4 +711,14 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+func payloadSignature(v interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+
+
 
