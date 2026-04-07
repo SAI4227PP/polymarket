@@ -111,7 +111,6 @@ func main() {
 	configKey := getenv("REDIS_CONFIG_KEY", "api:config:latest")
 	traderStateKey := getenv("REDIS_TRADER_STATE_KEY", "trader:state:latest")
 	finalTradesKey := getenv("REDIS_FINAL_TRADES_KEY", "trader:trades:latest")
-	tradeCompleteKey := getenv("REDIS_TRADE_COMPLETE_KEY", "trader:trade_complete:latest")
 	liveBTCKey := getenv("REDIS_LIVE_BTC_KEY", "trader:live_btc:latest")
 	pastOutcomesKey := getenv("REDIS_PAST_OUTCOMES_KEY", "trader:past_outcomes:latest")
 	portfolioDailyKey := getenv("REDIS_PORTFOLIO_DAILY_KEY", "trader:portfolio:daily")
@@ -136,6 +135,9 @@ func main() {
             } else if err := pg.EnsureTradeRecordsTable(ddlCtx); err != nil {
                 logger.Warn("postgres trade_records schema init failed; continuing without postgres sync", map[string]interface{}{"error": err.Error()})
                 _ = pg.Close()
+            } else if err := pg.EnsureTradeSnapshotsTable(ddlCtx); err != nil {
+                logger.Warn("postgres trade_snapshots schema init failed; continuing without postgres sync", map[string]interface{}{"error": err.Error()})
+                _ = pg.Close()
             } else {
                 pgClient = pg
             }
@@ -150,6 +152,7 @@ func main() {
     if pgClient != nil {
         go syncPortfolioDailyToPostgres(logger, cache, pgClient, portfolioDailyKey)
         go syncTradeRecordsToPostgres(logger, cache, pgClient, finalTradesKey)
+        go syncTradeSnapshotsToPostgres(logger, cache, pgClient, tradesKey, finalTradesKey)
     }
 
 	mux := http.NewServeMux()
@@ -207,6 +210,20 @@ func main() {
 		writeJSON(w, http.StatusOK, trades)
 	})
 
+	mux.HandleFunc("/trades/completed", func(w http.ResponseWriter, r *http.Request) {
+		limit := queryIntBounded(r, "limit", 50, 5000)
+
+		var trades []completedTrade
+		if err := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &trades, 1200*time.Millisecond); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			return
+		}
+		if limit > 0 && len(trades) > limit {
+			trades = trades[:limit]
+		}
+		writeJSON(w, http.StatusOK, trades)
+	})
+
 	snapshotHandler := func(w http.ResponseWriter, r *http.Request) {
 		var snap runner.Snapshot
 		if err := readCachedJSONWithTimeout(r.Context(), cache, snapshotKey, &snap, 1500*time.Millisecond); err != nil {
@@ -249,8 +266,8 @@ func main() {
 		ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
 		defer ticker.Stop()
 		initialBootstrapSent := false
-		lastTradesSig := ""
-		lastTradeCompleteSig := ""
+		lastRunningTradesSig := ""
+		lastCompletedTradesSig := ""
 
 		for {
 			var snap runner.Snapshot
@@ -258,18 +275,12 @@ func main() {
 
 			var state traderState
 			stateErr := readCachedJSONWithTimeout(r.Context(), cache, traderStateKey, &state, 1500*time.Millisecond)
-
-            tradesPayload := interface{}(snap.Trades)
+            runningTradesPayload := interface{}(snap.Trades)
             var finalTrades []completedTrade
-            _ = readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond)
-
-            var tradeCompletePayload interface{}
-            if err := readCachedJSONWithTimeout(r.Context(), cache, tradeCompleteKey, &tradeCompletePayload, 1200*time.Millisecond); err != nil {
-                if len(finalTrades) > 0 {
-                    tradeCompletePayload = finalTrades[len(finalTrades)-1]
-                } else {
-                    tradeCompletePayload = map[string]interface{}{"warning": err.Error()}
-                }
+            finalTradesErr := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond)
+            completedTradesPayload := interface{}(finalTrades)
+            if finalTradesErr != nil {
+                completedTradesPayload = interface{}([]completedTrade{})
             }
 
             var liveBTCPayload interface{}
@@ -378,10 +389,10 @@ func main() {
                     portfolioSection["today_stats"] = todayStats
                 }
             }
-			tradesSig := payloadSignature(tradesPayload)
-			tradeCompleteSig := payloadSignature(tradeCompletePayload)
+			runningTradesSig := payloadSignature(runningTradesPayload)
+			completedTradesSig := payloadSignature(completedTradesPayload)
 			now := time.Now().UTC()
-			events := make([]streamEnvelope, 0, 8)
+			events := make([]streamEnvelope, 0, 10)
 			if !initialBootstrapSent {
 				events = append(events,
 					streamEnvelope{
@@ -397,8 +408,13 @@ func main() {
 					streamEnvelope{
 						Type:      "trades",
 						Timestamp: now,
-						Data:      tradesPayload,
+						Data:      runningTradesPayload,
 					},
+                    streamEnvelope{
+                        Type:      "completed_trades",
+                        Timestamp: now,
+                        Data:      completedTradesPayload,
+                    },
 				)
 			}
 			events = append(events,
@@ -428,42 +444,30 @@ func main() {
                     Data:      pastOutcomesPayload,
                 },
 			)
-			tradeClosed := initialBootstrapSent && tradeCompleteSig != "" && tradeCompleteSig != lastTradeCompleteSig
-			if tradeClosed {
-				events = append(events,
-					streamEnvelope{
-						Type:      "trade_complete",
-						Timestamp: now,
-						Data:      tradeCompletePayload,
-					},
-					streamEnvelope{
-						Type:      "portfolio",
-						Timestamp: now,
-						Data:      portfolioSection,
-					},
-					streamEnvelope{
-						Type:      "trades",
-						Timestamp: now,
-						Data:      tradesPayload,
-					},
-				)
-			} else if initialBootstrapSent && tradesSig != lastTradesSig {
-				events = append(events, streamEnvelope{
-					Type:      "trades",
-					Timestamp: now,
-					Data:      tradesPayload,
-				})
-			}
+            if initialBootstrapSent && runningTradesSig != lastRunningTradesSig {
+                events = append(events, streamEnvelope{
+                    Type:      "trades",
+                    Timestamp: now,
+                    Data:      runningTradesPayload,
+                })
+            }
+            if initialBootstrapSent && completedTradesSig != lastCompletedTradesSig {
+                events = append(events, streamEnvelope{
+                    Type:      "completed_trades",
+                    Timestamp: now,
+                    Data:      completedTradesPayload,
+                })
+            }
 			for _, env := range events {
+				_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 				if err := conn.WriteJSON(env); err != nil {
 					logger.Warn("websocket client disconnected", map[string]interface{}{"error": err.Error(), "event_type": env.Type})
 					return
 				}
 			}
 			initialBootstrapSent = true
-			lastTradesSig = tradesSig
-			lastTradeCompleteSig = tradeCompleteSig
-
+            lastRunningTradesSig = runningTradesSig
+            lastCompletedTradesSig = completedTradesSig
 			select {
 			case <-r.Context().Done():
 				return
@@ -648,6 +652,65 @@ func syncTradeRecordsToPostgres(
 		<-ticker.C
 	}
 }
+func syncTradeSnapshotsToPostgres(
+	logger monitoring.Logger,
+	cache *storage.RedisCache,
+	db *storage.Client,
+	runningTradesKey string,
+	completedTradesKey string,
+) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+		runningTrades := make([]storage.TradeRecord, 0)
+		if err := cache.GetJSON(ctx, runningTradesKey, &runningTrades); err != nil && !errors.Is(err, redis.Nil) {
+			logger.Warn("postgres sync running trades snapshot read failed", map[string]interface{}{"error": err.Error()})
+		}
+		if err := db.UpsertTradeSnapshot(ctx, storage.TradeSnapshotRecord{
+			SnapshotType: "running_trades",
+			Payload:      runningTrades,
+			UpdatedAtMs:  uint64(time.Now().UTC().UnixMilli()),
+		}); err != nil {
+			logger.Warn("postgres upsert running trades snapshot failed", map[string]interface{}{"error": err.Error()})
+		}
+
+		completedTrades := make([]completedTrade, 0)
+		if err := cache.GetJSON(ctx, completedTradesKey, &completedTrades); err != nil && !errors.Is(err, redis.Nil) {
+			logger.Warn("postgres sync completed trades snapshot read failed", map[string]interface{}{"error": err.Error()})
+		}
+		nowMs := uint64(time.Now().UTC().UnixMilli())
+		if err := db.UpsertTradeSnapshot(ctx, storage.TradeSnapshotRecord{
+			SnapshotType: "completed_trades",
+			Payload:      completedTrades,
+			UpdatedAtMs:  nowMs,
+		}); err != nil {
+			logger.Warn("postgres upsert completed trades snapshot failed", map[string]interface{}{"error": err.Error()})
+		}
+
+		var latestCompletePayload interface{}
+		if len(completedTrades) > 0 {
+			latestCompletePayload = completedTrades[len(completedTrades)-1]
+		}
+		tradeCompleteEnvelope := streamEnvelope{
+			Type:      "trade_complete",
+			Timestamp: time.Now().UTC(),
+			Data:      latestCompletePayload,
+		}
+		if err := db.UpsertTradeSnapshot(ctx, storage.TradeSnapshotRecord{
+			SnapshotType: "trade_complete",
+			Payload:      tradeCompleteEnvelope,
+			UpdatedAtMs:  nowMs,
+		}); err != nil {
+			logger.Warn("postgres upsert trade_complete snapshot failed", map[string]interface{}{"error": err.Error()})
+		}
+
+		cancel()
+		<-ticker.C
+	}
+}
 func filterTrades(trades []storage.TradeRecord, status storage.TradeStatus) []storage.TradeRecord {
 	if status == "" {
 		return trades
@@ -718,7 +781,3 @@ func payloadSignature(v interface{}) string {
 	}
 	return string(b)
 }
-
-
-
-

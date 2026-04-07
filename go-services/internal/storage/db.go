@@ -165,6 +165,22 @@ CREATE TABLE IF NOT EXISTS trade_records (
 	return err
 }
 
+func (c *Client) EnsureTradeSnapshotsTable(ctx context.Context) error {
+	if c == nil || c.db == nil {
+		return errors.New("database client is not connected")
+	}
+	const ddl = `
+CREATE TABLE IF NOT EXISTS trade_snapshots (
+    snapshot_type TEXT PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at_ms BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
+	_, err := c.db.ExecContext(ctx, ddl)
+	return err
+}
+
 func (c *Client) UpsertTradeRecord(ctx context.Context, rec TradeRecord) error {
 	if c == nil || c.db == nil {
 		return errors.New("database client is not connected")
@@ -223,6 +239,45 @@ ON CONFLICT (id) DO UPDATE SET
 	)
 	return err
 }
+func (c *Client) UpsertTradeSnapshot(ctx context.Context, rec TradeSnapshotRecord) error {
+	if c == nil || c.db == nil {
+		return errors.New("database client is not connected")
+	}
+	if strings.TrimSpace(rec.SnapshotType) == "" {
+		return errors.New("snapshot type is required")
+	}
+	if rec.UpdatedAtMs == 0 {
+		rec.UpdatedAtMs = uint64(time.Now().UTC().UnixMilli())
+	}
+	payloadJSON := []byte("[]")
+	if rec.Payload != nil {
+		b, err := json.Marshal(rec.Payload)
+		if err != nil {
+			return err
+		}
+		payloadJSON = b
+	}
+
+	const upsert = `
+INSERT INTO trade_snapshots (
+    snapshot_type, payload, updated_at_ms, updated_at
+) VALUES (
+    $1, $2::jsonb, $3, NOW()
+)
+ON CONFLICT (snapshot_type) DO UPDATE SET
+    payload = EXCLUDED.payload,
+    updated_at_ms = EXCLUDED.updated_at_ms,
+    updated_at = NOW();
+`
+	_, err := c.db.ExecContext(
+		ctx,
+		upsert,
+		rec.SnapshotType,
+		string(payloadJSON),
+		rec.UpdatedAtMs,
+	)
+	return err
+}
 func RedactDSN(dsn string) string {
 	if dsn == "" {
 		return dsn
@@ -234,4 +289,3 @@ func RedactDSN(dsn string) string {
 	}
 	return dsn[:proto+3] + "***:***" + dsn[at:]
 }
-

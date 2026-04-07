@@ -93,8 +93,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "trader:state:latest".to_string());
     let redis_final_trades_key = std::env::var("REDIS_FINAL_TRADES_KEY")
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
-    let redis_trade_complete_key = std::env::var("REDIS_TRADE_COMPLETE_KEY")
-        .unwrap_or_else(|_| "trader:trade_complete:latest".to_string());
     let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
         .unwrap_or_else(|_| "trader:live_btc:latest".to_string());
     let redis_past_outcomes_key = std::env::var("REDIS_PAST_OUTCOMES_KEY")
@@ -319,16 +317,6 @@ async fn main() -> Result<()> {
                 .await
                 {
                     eprintln!("redis trade-history publish error: {err:#}");
-                }
-                if let Err(err) = publish_trade_complete_to_redis(
-                    &redis_url,
-                    &redis_trade_complete_key,
-                    trade_history.last(),
-                    &mut redis_conn,
-                )
-                .await
-                {
-                    eprintln!("redis trade-complete publish error: {err:#}");
                 }
                 if let Err(err) = publish_aux_stream_payloads_to_redis(
                     &redis_url,
@@ -790,38 +778,6 @@ async fn publish_trades_to_redis(
 }
 
 
-async fn publish_trade_complete_to_redis(
-    redis_url: &str,
-    key: &str,
-    trade: Option<&CompletedTrade>,
-    conn: &mut Option<MultiplexedConnection>,
-) -> Result<()> {
-    if conn.is_none() {
-        let client = redis::Client::open(redis_url).context("invalid redis url")?;
-        let c = client
-            .get_multiplexed_async_connection()
-            .await
-            .context("connect to redis")?;
-        *conn = Some(c);
-    }
-
-    let payload = if let Some(trade) = trade {
-        serde_json::to_string(trade).context("serialize trade complete")?
-    } else {
-        serde_json::to_string(&json!({ "warning": "trade complete unavailable" }))
-            .context("serialize trade complete warning")?
-    };
-
-    if let Some(c) = conn.as_mut() {
-        let set_res: redis::RedisResult<()> = c.set(key, payload).await;
-        if let Err(e) = set_res {
-            *conn = None;
-            return Err(anyhow!("redis set trade complete failed: {e}"));
-        }
-    }
-
-    Ok(())
-}
 async fn publish_portfolio_daily_to_redis(
     redis_url: &str,
     key: &str,

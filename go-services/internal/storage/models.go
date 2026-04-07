@@ -37,6 +37,12 @@ type PortfolioDayRecord struct {
 	UpdatedAtMs        uint64
 }
 
+type TradeSnapshotRecord struct {
+	SnapshotType string
+	Payload      any
+	UpdatedAtMs  uint64
+}
+
 func (t *TradeRecord) Touch(now time.Time) {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = now
