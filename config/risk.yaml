@@ -2,5 +2,7 @@ max_notional_usd: 1000
 max_daily_loss_usd: 100
 max_open_positions: 3
 kill_switch_drawdown_pct: 5.0
+kill_switch_min_peak_pnl_usd: 5.0
 kill_switch_error_streak: 5
+kill_switch_stale_data_ms: 15000
 min_edge_bps: 8

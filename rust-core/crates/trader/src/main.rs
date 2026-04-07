@@ -90,6 +90,7 @@ struct TraderState {
     portfolio_unrealized_pnl_usd: f64,
     portfolio_total_pnl_usd: f64,
     portfolio_all_time_realized_pnl_usd: f64,
+    portfolio_drawdown_pct_from_peak: f64,
 }
 
 #[tokio::main]
@@ -187,6 +188,10 @@ async fn main() -> Result<()> {
     let mut last_past_probability: Option<f64> = None;
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
+    let min_peak_pnl_for_drawdown_pct = env_f64("KILL_SWITCH_MIN_PEAK_PNL_USD", 5.0).max(0.0);
+    let mut peak_total_pnl_usd = 0.0_f64;
+    let mut current_drawdown_pct = 0.0_f64;
+    let mut last_mark_price: Option<f64> = None;
     let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
 
     let initial_open_trades_payload = build_open_trades(&pending_positions);
@@ -320,6 +325,13 @@ async fn main() -> Result<()> {
                 state.portfolio_unrealized_pnl_usd = unrealized_pnl_usd;
                 state.portfolio_total_pnl_usd = total_pnl_usd;
                 state.portfolio_all_time_realized_pnl_usd = portfolio_realized_pnl_usd;
+                if total_pnl_usd > peak_total_pnl_usd {
+                    peak_total_pnl_usd = total_pnl_usd;
+                }
+                current_drawdown_pct =
+                    pnl_drawdown_pct_from_peak(total_pnl_usd, peak_total_pnl_usd, min_peak_pnl_for_drawdown_pct);
+                state.portfolio_drawdown_pct_from_peak = current_drawdown_pct;
+                last_mark_price = Some(mark_price);
 
                 let day_key = utc_day_string(state.ts_ms);
                 update_daily_history(
@@ -400,14 +412,54 @@ async fn main() -> Result<()> {
 
         if should_kill(
             KillSwitchState {
-                current_drawdown_pct: env_f64("CURRENT_DRAWDOWN_PCT", 0.0),
+                current_drawdown_pct,
                 error_streak,
                 oldest_quote_age_ms,
             },
             kill_cfg,
         ) {
+            if let Some(close_price) = last_mark_price {
+                let close_reason = format!("kill_switch_drawdown_{:.2}pct", current_drawdown_pct);
+                let close_ts_ms = now_ms();
+                let closed_now = close_positions_now(
+                    &mut pending_positions,
+                    &mut day_pnl_usd,
+                    &mut portfolio_realized_pnl_usd,
+                    close_price,
+                    close_ts_ms,
+                    &close_reason,
+                );
+                if !closed_now.is_empty() {
+                    trade_history.extend(closed_now);
+                    trim_history(&mut trade_history, trade_history_limit);
+
+                    if let Err(err) = publish_open_trades_to_redis(
+                        &redis_url,
+                        &redis_open_trades_key,
+                        &[],
+                        &mut redis_conn,
+                    )
+                    .await
+                    {
+                        eprintln!("redis open-trades publish on kill error: {err:#}");
+                    }
+
+                    if let Err(err) = publish_trades_to_redis(
+                        &redis_url,
+                        &redis_final_trades_key,
+                        &trade_history,
+                        &mut redis_conn,
+                    )
+                    .await
+                    {
+                        eprintln!("redis trade-history publish on kill error: {err:#}");
+                    }
+                }
+            }
+
             return Err(anyhow!(
-                "kill switch triggered drawdown_or_error_streak={} stale_ms={}",
+                "kill switch triggered drawdown_pct={:.2} error_streak={} stale_ms={}",
+                current_drawdown_pct,
                 error_streak,
                 oldest_quote_age_ms
             ));
@@ -732,6 +784,7 @@ async fn run_iteration(
         portfolio_unrealized_pnl_usd: 0.0,
         portfolio_total_pnl_usd: day_pnl_usd,
         portfolio_all_time_realized_pnl_usd: 0.0,
+        portfolio_drawdown_pct_from_peak: 0.0,
     };
 
     if report.accepted {
@@ -1001,7 +1054,20 @@ fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
         portfolio_unrealized_pnl_usd: 0.0,
         portfolio_total_pnl_usd: day_pnl_usd,
         portfolio_all_time_realized_pnl_usd: 0.0,
+        portfolio_drawdown_pct_from_peak: 0.0,
     }
+}
+
+fn pnl_drawdown_pct_from_peak(current_total_pnl_usd: f64, peak_total_pnl_usd: f64, min_peak_pnl_usd: f64) -> f64 {
+    if !current_total_pnl_usd.is_finite() || !peak_total_pnl_usd.is_finite() {
+        return 0.0;
+    }
+    if peak_total_pnl_usd <= 0.0 || peak_total_pnl_usd < min_peak_pnl_usd {
+        return 0.0;
+    }
+
+    let giveback_usd = (peak_total_pnl_usd - current_total_pnl_usd).max(0.0);
+    (giveback_usd / peak_total_pnl_usd) * 100.0
 }
 
 fn build_open_trades(pending_positions: &[PendingPosition]) -> Vec<OpenTrade> {
