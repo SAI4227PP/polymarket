@@ -3,14 +3,16 @@ use adapters_binance::{ws as binance_ws, BinanceClient};
 use adapters_polymarket::{ws as polymarket_ws, PolymarketClient};
 use common::{Quote, RiskDecision, TradeDirection};
 use execution_engine::order_manager::{self, ExecutionConfig};
-use portfolio_engine::pnl::total_pnl;
-use portfolio_engine::positions::{mark_to_market, update_position, Position};
+use portfolio_engine::daily::{update_daily_history, PortfolioDayStats};
+use portfolio_engine::pnl::{total_pnl, unrealized_pnl};
+use portfolio_engine::positions::{update_position, Position};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use risk_engine::kill_switch::{should_kill, KillSwitchConfig, KillSwitchState};
 use risk_engine::limits::{evaluate_trade, RiskInput, RiskLimits};
 use serde::Serialize;
 use serde_json::json;
 use strategy_engine::signals::{compute_signal, SignalConfig};
+use std::collections::HashMap;
 use tokio::sync::watch;
 use tokio::time::{interval, sleep, Duration};
 
@@ -69,8 +71,10 @@ struct TraderState {
     oldest_quote_age_ms: u64,
     portfolio_net_qty: f64,
     portfolio_avg_entry: f64,
+    portfolio_realized_pnl_usd: f64,
     portfolio_unrealized_pnl_usd: f64,
     portfolio_total_pnl_usd: f64,
+    portfolio_all_time_realized_pnl_usd: f64,
 }
 
 #[tokio::main]
@@ -89,10 +93,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "trader:state:latest".to_string());
     let redis_final_trades_key = std::env::var("REDIS_FINAL_TRADES_KEY")
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
+    let redis_trade_complete_key = std::env::var("REDIS_TRADE_COMPLETE_KEY")
+        .unwrap_or_else(|_| "trader:trade_complete:latest".to_string());
     let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
         .unwrap_or_else(|_| "trader:live_btc:latest".to_string());
     let redis_past_outcomes_key = std::env::var("REDIS_PAST_OUTCOMES_KEY")
         .unwrap_or_else(|_| "trader:past_outcomes:latest".to_string());
+    let redis_portfolio_daily_key = std::env::var("REDIS_PORTFOLIO_DAILY_KEY")
+        .unwrap_or_else(|_| "trader:portfolio:daily".to_string());
     let configured_event_slug = std::env::var("POLYMARKET_EVENT_SLUG").unwrap_or_default();
     let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
 
@@ -145,11 +153,26 @@ async fn main() -> Result<()> {
 
     let mut ticker = interval(Duration::from_millis(loop_ms));
     let mut day_pnl_usd = 0.0;
+    let mut portfolio_realized_pnl_usd = 0.0;
     let mut pending_positions: Vec<PendingPosition> = Vec::new();
     let mut trade_history: Vec<CompletedTrade> = Vec::new();
+    let mut portfolio_daily_history = match load_portfolio_daily_from_redis(
+        &redis_url,
+        &redis_portfolio_daily_key,
+        &mut redis_conn,
+    )
+    .await
+    {
+        Ok(history) => history,
+        Err(err) => {
+            eprintln!("redis portfolio-daily load error: {err:#}");
+            HashMap::new()
+        }
+    };
     let mut last_past_probability: Option<f64> = None;
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
+    let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
 
     loop {
         ticker.tick().await;
@@ -165,9 +188,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
         if enforce_position_ttl {
-            let closed = settle_expired_positions(&mut pending_positions, &mut day_pnl_usd, now_ms());
+            let closed = settle_expired_positions(
+                &mut pending_positions,
+                &mut day_pnl_usd,
+                &mut portfolio_realized_pnl_usd,
+                now_ms(),
+            );
             if !closed.is_empty() {
                 trade_history.extend(closed);
                 trim_history(&mut trade_history, trade_history_limit);
@@ -218,6 +245,7 @@ async fn main() -> Result<()> {
                     let closed_now = close_positions_now(
                         &mut pending_positions,
                         &mut day_pnl_usd,
+                        &mut portfolio_realized_pnl_usd,
                         state.polymarket_mid,
                         close_ts_ms,
                         close_reason.as_deref().unwrap_or("exit_signal"),
@@ -235,10 +263,9 @@ async fn main() -> Result<()> {
                 let mut state = state;
                 let portfolio_position = build_portfolio_position(&pending_positions);
                 let mark_price = state.polymarket_mid.clamp(0.0, 1.0);
-                let marked_total = mark_to_market(&portfolio_position, mark_price);
-                let unrealized_pnl_usd = marked_total - portfolio_position.realized_pnl;
+                let unrealized_pnl_usd = unrealized_pnl(portfolio_position.avg_price, mark_price, portfolio_position.qty);
                 let total_pnl_usd = total_pnl(
-                    day_pnl_usd,
+                    portfolio_realized_pnl_usd,
                     portfolio_position.avg_price,
                     mark_price,
                     portfolio_position.qty,
@@ -248,8 +275,29 @@ async fn main() -> Result<()> {
                 state.day_pnl_usd = day_pnl_usd;
                 state.portfolio_net_qty = portfolio_position.qty;
                 state.portfolio_avg_entry = portfolio_position.avg_price;
+                state.portfolio_realized_pnl_usd = portfolio_realized_pnl_usd;
                 state.portfolio_unrealized_pnl_usd = unrealized_pnl_usd;
                 state.portfolio_total_pnl_usd = total_pnl_usd;
+                state.portfolio_all_time_realized_pnl_usd = portfolio_realized_pnl_usd;
+
+                let day_key = utc_day_string(state.ts_ms);
+                update_daily_history(
+                    &mut portfolio_daily_history,
+                    day_key,
+                    state.portfolio_total_pnl_usd,
+                    state.ts_ms,
+                );
+
+                if let Err(err) = publish_portfolio_daily_to_redis(
+                    &redis_url,
+                    &redis_portfolio_daily_key,
+                    &portfolio_daily_history,
+                    &mut redis_conn,
+                )
+                .await
+                {
+                    eprintln!("redis portfolio-daily publish error: {err:#}");
+                }
 
                 if let Err(err) = publish_state_to_redis(
                     &redis_url,
@@ -271,6 +319,16 @@ async fn main() -> Result<()> {
                 .await
                 {
                     eprintln!("redis trade-history publish error: {err:#}");
+                }
+                if let Err(err) = publish_trade_complete_to_redis(
+                    &redis_url,
+                    &redis_trade_complete_key,
+                    trade_history.last(),
+                    &mut redis_conn,
+                )
+                .await
+                {
+                    eprintln!("redis trade-complete publish error: {err:#}");
                 }
                 if let Err(err) = publish_aux_stream_payloads_to_redis(
                     &redis_url,
@@ -355,6 +413,19 @@ async fn run_iteration(
             });
         }
     };
+    if !is_tradeable_polymarket_quote(&pm_quote) {
+        let mut state = waiting_state(day_pnl_usd, open_positions);
+        state.action = "waiting_tradeable_polymarket_quote".to_string();
+        state.execution_status = format!("waiting:ignored_non_tradeable_venue {}", pm_quote.venue);
+        state.oldest_quote_age_ms = now_ms().saturating_sub(pm_quote.ts_ms);
+        return Ok(IterationOutcome {
+            position: None,
+            state,
+            close_open_positions: false,
+            close_reason: None,
+        });
+    }
+
     let bn_quote = match bn_rx.borrow().clone() {
         Some(q) => q,
         None => {
@@ -367,7 +438,6 @@ async fn run_iteration(
             });
         }
     };
-
     if env_bool("TRADER_DEBUG_QUOTES", false) {
         eprintln!(
             "engine quotes pm={{venue:{} symbol:{} price:{:.4} ts_ms:{}}} bn={{venue:{} symbol:{} price:{:.2} ts_ms:{}}}",
@@ -480,21 +550,35 @@ async fn run_iteration(
 
     let entry_signal = can_open_new_position && signal.should_trade && risk.allowed && report.accepted;
     let hold_strong_edge_bps = env_f64("HOLD_STRONG_EDGE_BPS", (signal_cfg.min_edge_bps * 0.6).max(1.0));
+    let invalidation_close_bps =
+        env_f64("INVALIDATION_CLOSE_BPS", (signal_cfg.min_edge_bps * 0.8).max(4.0));
     let strong_same_direction = has_open_positions
         && open_direction
             .map(|d| signal.direction == d && signal.net_edge_bps >= hold_strong_edge_bps)
             .unwrap_or(false);
+    let invalidation_deadband_hold = has_open_positions
+        && !signal.should_trade
+        && signal.net_edge_bps.abs() < invalidation_close_bps;
 
     if !report.accepted && has_open_positions && strong_same_direction {
         report.status = format!(
             "hold:strong_direction net_edge_bps={:.2} hold_threshold_bps={:.2}",
             signal.net_edge_bps, hold_strong_edge_bps
         );
+    } else if !report.accepted && invalidation_deadband_hold {
+        report.status = format!(
+            "hold:invalidation_deadband net_edge_bps={:.2} close_threshold_bps={:.2}",
+            signal.net_edge_bps, invalidation_close_bps
+        );
     }
 
     let close_reason = if reversal_signal {
         Some("reverse_signal".to_string())
-    } else if has_open_positions && !signal.should_trade && !strong_same_direction {
+    } else if has_open_positions
+        && !signal.should_trade
+        && !strong_same_direction
+        && !invalidation_deadband_hold
+    {
         Some("signal_invalidated".to_string())
     } else if has_open_positions && !pm_fresh {
         Some("stale_polymarket".to_string())
@@ -580,8 +664,10 @@ async fn run_iteration(
         oldest_quote_age_ms,
         portfolio_net_qty: 0.0,
         portfolio_avg_entry: 0.0,
+        portfolio_realized_pnl_usd: 0.0,
         portfolio_unrealized_pnl_usd: 0.0,
         portfolio_total_pnl_usd: day_pnl_usd,
+        portfolio_all_time_realized_pnl_usd: 0.0,
     };
 
     if report.accepted {
@@ -614,6 +700,39 @@ async fn run_iteration(
     })
 }
 
+
+async fn load_portfolio_daily_from_redis(
+    redis_url: &str,
+    key: &str,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<HashMap<String, PortfolioDayStats>> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    if let Some(c) = conn.as_mut() {
+        let get_res: redis::RedisResult<Option<String>> = c.get(key).await;
+        match get_res {
+            Ok(Some(raw)) => {
+                let parsed = serde_json::from_str::<HashMap<String, PortfolioDayStats>>(&raw)
+                    .context("deserialize portfolio daily history")?;
+                Ok(parsed)
+            }
+            Ok(None) => Ok(HashMap::new()),
+            Err(e) => {
+                *conn = None;
+                Err(anyhow!("redis get portfolio daily failed: {e}"))
+            }
+        }
+    } else {
+        Ok(HashMap::new())
+    }
+}
 async fn publish_state_to_redis(
     redis_url: &str,
     key: &str,
@@ -670,6 +789,66 @@ async fn publish_trades_to_redis(
     Ok(())
 }
 
+
+async fn publish_trade_complete_to_redis(
+    redis_url: &str,
+    key: &str,
+    trade: Option<&CompletedTrade>,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    let payload = if let Some(trade) = trade {
+        serde_json::to_string(trade).context("serialize trade complete")?
+    } else {
+        serde_json::to_string(&json!({ "warning": "trade complete unavailable" }))
+            .context("serialize trade complete warning")?
+    };
+
+    if let Some(c) = conn.as_mut() {
+        let set_res: redis::RedisResult<()> = c.set(key, payload).await;
+        if let Err(e) = set_res {
+            *conn = None;
+            return Err(anyhow!("redis set trade complete failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
+async fn publish_portfolio_daily_to_redis(
+    redis_url: &str,
+    key: &str,
+    daily: &HashMap<String, PortfolioDayStats>,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    let payload = serde_json::to_string(daily).context("serialize portfolio daily history")?;
+
+    if let Some(c) = conn.as_mut() {
+        let set_res: redis::RedisResult<()> = c.set(key, payload).await;
+        if let Err(e) = set_res {
+            *conn = None;
+            return Err(anyhow!("redis set portfolio daily failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
 async fn publish_aux_stream_payloads_to_redis(
     redis_url: &str,
     live_btc_key: &str,
@@ -758,8 +937,10 @@ fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
         oldest_quote_age_ms: 0,
         portfolio_net_qty: 0.0,
         portfolio_avg_entry: 0.0,
+        portfolio_realized_pnl_usd: 0.0,
         portfolio_unrealized_pnl_usd: 0.0,
         portfolio_total_pnl_usd: day_pnl_usd,
+        portfolio_all_time_realized_pnl_usd: 0.0,
     }
 }
 
@@ -881,9 +1062,14 @@ fn current_open_direction(pending_positions: &[PendingPosition]) -> Option<Trade
     pending_positions.first().map(|p| p.direction)
 }
 
+fn is_tradeable_polymarket_quote(q: &Quote) -> bool {
+    matches!(q.venue.as_str(), "polymarket" | "polymarket-live-data")
+}
+
 fn close_positions_now(
     pending_positions: &mut Vec<PendingPosition>,
     day_pnl_usd: &mut f64,
+    portfolio_realized_pnl_usd: &mut f64,
     close_price: f64,
     close_ts_ms: u64,
     reason: &str,
@@ -893,6 +1079,7 @@ fn close_positions_now(
     for pos in pending_positions.drain(..) {
         let pnl_usd = position_pnl_usd(pos.direction, pos.quantity, pos.entry_price, close_price);
         *day_pnl_usd += pnl_usd;
+        *portfolio_realized_pnl_usd += pnl_usd;
         let exit_notional_usd = (close_price * pos.quantity).max(0.0);
 
         closed.push(CompletedTrade {
@@ -950,6 +1137,7 @@ fn position_pnl_usd(direction: TradeDirection, quantity: f64, entry_price: f64, 
 fn settle_expired_positions(
     pending_positions: &mut Vec<PendingPosition>,
     day_pnl_usd: &mut f64,
+    portfolio_realized_pnl_usd: &mut f64,
     now_ms: u64,
 ) -> Vec<CompletedTrade> {
     let mut keep = Vec::with_capacity(pending_positions.len());
@@ -958,6 +1146,7 @@ fn settle_expired_positions(
     for pos in pending_positions.drain(..) {
         if pos.settle_at_ms <= now_ms {
             *day_pnl_usd += pos.expected_pnl_usd;
+            *portfolio_realized_pnl_usd += pos.expected_pnl_usd;
             let exit_notional_usd = (pos.entry_notional_usd + pos.expected_pnl_usd).max(0.0);
             let exit_price = if pos.quantity > 0.0 {
                 exit_notional_usd / pos.quantity
@@ -1058,6 +1247,26 @@ fn is_last_seconds_of_five_min_window(now_ms: u64, block_last_seconds: u64) -> b
     let block_ms = block_last_seconds.saturating_mul(1_000).min(window_ms - 1);
     let elapsed_in_window = now_ms % window_ms;
     elapsed_in_window >= (window_ms - block_ms)
+}
+
+fn utc_day_string(ts_ms: u64) -> String {
+    let days_since_epoch = (ts_ms / 1_000 / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    format!("{:04}-{:02}-{:02}", year, month, day)
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m, d)
 }
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1188,7 +1397,15 @@ mod tests {
         assert!(out2.position.is_none(), "should not open DOWN in same iteration as close");
 
         let mut day_pnl_usd = 0.0;
-        let closed = close_positions_now(&mut pending, &mut day_pnl_usd, out2.state.polymarket_mid, now2, "reverse_signal");
+        let mut portfolio_realized_pnl_usd = 0.0;
+        let closed = close_positions_now(
+            &mut pending,
+            &mut day_pnl_usd,
+            &mut portfolio_realized_pnl_usd,
+            out2.state.polymarket_mid,
+            now2,
+            "reverse_signal",
+        );
         assert_eq!(pending.len(), 0, "pending positions must be cleared after close");
         assert!(!closed.is_empty(), "should record a closed trade");
         assert_eq!(closed[0].entry_side, "buy");
@@ -1286,6 +1503,105 @@ mod tests {
         assert!(!hold.close_open_positions, "existing position should not be force-closed");
         assert!(hold.close_reason.is_none(), "no risk_rejected close expected");
         assert!(hold.position.is_none(), "should not open a second position while one is live");
+    }
+
+    #[tokio::test]
+    async fn ignores_non_tradeable_polymarket_seed_quotes() {
+        let now = now_ms();
+        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
+
+        pm_tx.send_replace(Some(q("polymarket-past-results", 0.42, now)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
+
+        let out = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            0.0,
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+        )
+        .await
+        .expect("iteration should succeed");
+
+        assert!(out.position.is_none(), "must not trade on seed quote venues");
+        assert!(!out.close_open_positions, "must not close solely on seed quote venues");
+        assert_eq!(
+            out.state.action,
+            "waiting_tradeable_polymarket_quote",
+            "state should indicate waiting for tradable quote"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_deadband_holds_instead_of_churn_close() {
+        let now = now_ms();
+        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
+
+        // Open a position first.
+        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
+
+        let opened = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            0.0,
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+        )
+        .await
+        .expect("open iteration should succeed");
+
+        let pos = opened.position.expect("expected position to be opened");
+
+        // With tiny/noisy edge around current price, deadband should hold, not close.
+        let now2 = now + 1_000;
+        pm_tx.send_replace(Some(q("polymarket", pos.entry_price, now2)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now2)));
+
+        let hold = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            1,
+            Some(pos.direction),
+            pos.entry_notional_usd.abs(),
+            pos.entry_notional_usd.abs(),
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+        )
+        .await
+        .expect("hold iteration should succeed");
+
+        assert!(!hold.close_open_positions, "deadband should avoid churn close");
+        assert!(hold.position.is_none(), "no second position while one is open");
     }
 
     #[test]

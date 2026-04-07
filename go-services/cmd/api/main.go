@@ -40,8 +40,10 @@ type traderState struct {
 	DayPnlUSD       float64 `json:"day_pnl_usd"`
 	PortfolioNetQty        float64 `json:"portfolio_net_qty"`
 	PortfolioAvgEntry      float64 `json:"portfolio_avg_entry"`
+    PortfolioRealizedPnL        float64 `json:"portfolio_realized_pnl_usd"`
 	PortfolioUnrealizedPnL float64 `json:"portfolio_unrealized_pnl_usd"`
 	PortfolioTotalPnL      float64 `json:"portfolio_total_pnl_usd"`
+    PortfolioAllTimeRealizedPnL float64 `json:"portfolio_all_time_realized_pnl_usd"`
 }
 
 type completedTrade struct {
@@ -70,13 +72,25 @@ type streamEnvelope struct {
 }
 
 type streamFrame struct {
-	Snapshot     runner.Snapshot        `json:"snapshot"`
-	Trades       interface{}            `json:"trades"`
-	LiveBTC      interface{}            `json:"live_btc"`
-	PastOutcomes interface{}            `json:"past_outcomes"`
-	Market       map[string]interface{} `json:"market"`
-	Signal       map[string]interface{} `json:"signal"`
-	Execution    map[string]interface{} `json:"execution"`
+	Snapshot      runner.Snapshot        `json:"snapshot"`
+	Trades        interface{}            `json:"trades"`
+	TradeComplete interface{}            `json:"trade_complete"`
+	LiveBTC       interface{}            `json:"live_btc"`
+	PastOutcomes  interface{}            `json:"past_outcomes"`
+	Market        map[string]interface{} `json:"market"`
+	Signal        map[string]interface{} `json:"signal"`
+	Execution     map[string]interface{} `json:"execution"`
+	Portfolio     map[string]interface{} `json:"portfolio"`
+}
+
+type portfolioDayStats struct {
+	Day              string    `json:"day"`
+	StartTotalPnLUSD float64   `json:"start_total_pnl_usd"`
+	CurrentTotalPnL  float64   `json:"current_total_pnl_usd"`
+	DayPnLUSD        float64   `json:"day_pnl_usd"`
+	DayMaxUpUSD      float64   `json:"day_max_up_usd"`
+	DayMaxDropUSD    float64   `json:"day_max_drop_usd"`
+    UpdatedAtMs      uint64    `json:"updated_at_ms"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -109,10 +123,46 @@ func main() {
 	configKey := getenv("REDIS_CONFIG_KEY", "api:config:latest")
 	traderStateKey := getenv("REDIS_TRADER_STATE_KEY", "trader:state:latest")
 	finalTradesKey := getenv("REDIS_FINAL_TRADES_KEY", "trader:trades:latest")
+	tradeCompleteKey := getenv("REDIS_TRADE_COMPLETE_KEY", "trader:trade_complete:latest")
 	liveBTCKey := getenv("REDIS_LIVE_BTC_KEY", "trader:live_btc:latest")
 	pastOutcomesKey := getenv("REDIS_PAST_OUTCOMES_KEY", "trader:past_outcomes:latest")
+	portfolioDailyKey := getenv("REDIS_PORTFOLIO_DAILY_KEY", "trader:portfolio:daily")
+
+    postgresURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+    if postgresURL == "" {
+        postgresURL = strings.TrimSpace(os.Getenv("POSTGRES_URL"))
+    }
+
+    var pgClient *storage.Client
+    if postgresURL != "" {
+        dbCtx, dbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+        pg, dbErr := storage.Connect(dbCtx, storage.DBConfig{URL: postgresURL, MaxOpenConns: 5, MaxIdleConns: 2})
+        dbCancel()
+        if dbErr != nil {
+            logger.Warn("postgres connect failed; continuing without postgres sync", map[string]interface{}{"error": dbErr.Error()})
+        } else {
+            ddlCtx, ddlCancel := context.WithTimeout(context.Background(), 5*time.Second)
+            if err := pg.EnsurePortfolioDailyTable(ddlCtx); err != nil {
+                logger.Warn("postgres portfolio_daily_stats schema init failed; continuing without postgres sync", map[string]interface{}{"error": err.Error()})
+                _ = pg.Close()
+            } else if err := pg.EnsureTradeRecordsTable(ddlCtx); err != nil {
+                logger.Warn("postgres trade_records schema init failed; continuing without postgres sync", map[string]interface{}{"error": err.Error()})
+                _ = pg.Close()
+            } else {
+                pgClient = pg
+            }
+            ddlCancel()
+        }
+    }
+    if pgClient != nil {
+        defer pgClient.Close()
+    }
 
 	go refreshRedisCache(logger, svc, cache, snapshotKey, statusKey, metricsKey, tradesKey, configKey)
+    if pgClient != nil {
+        go syncPortfolioDailyToPostgres(logger, cache, pgClient, portfolioDailyKey)
+        go syncTradeRecordsToPostgres(logger, cache, pgClient, finalTradesKey)
+    }
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -156,15 +206,6 @@ func main() {
 	mux.HandleFunc("/trades", func(w http.ResponseWriter, r *http.Request) {
 		limit := queryIntBounded(r, "limit", 50, 5000)
 
-		var finalTrades []completedTrade
-		if err := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond); err == nil {
-			if limit > 0 && len(finalTrades) > limit {
-				finalTrades = finalTrades[len(finalTrades)-limit:]
-			}
-			writeJSON(w, http.StatusOK, finalTrades)
-			return
-		}
-
 		var trades []storage.TradeRecord
 		if err := readCachedJSONWithTimeout(r.Context(), cache, tradesKey, &trades, 1200*time.Millisecond); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
@@ -198,6 +239,16 @@ func main() {
 		writeJSON(w, http.StatusOK, state)
 	})
 
+	
+    mux.HandleFunc("/portfolio/daily", func(w http.ResponseWriter, r *http.Request) {
+        history := make(map[string]portfolioDayStats)
+        if err := readCachedJSONWithTimeout(r.Context(), cache, portfolioDailyKey, &history, 1200*time.Millisecond); err != nil {
+            writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+            return
+        }
+        writeJSON(w, http.StatusOK, history)
+    })
+
 	mux.HandleFunc("/ws/stream", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -217,98 +268,138 @@ func main() {
 			var state traderState
 			stateErr := readCachedJSONWithTimeout(r.Context(), cache, traderStateKey, &state, 1500*time.Millisecond)
 
-			tradesPayload := interface{}(snap.Trades)
-			var finalTrades []completedTrade
-			if err := readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond); err == nil {
-				tradesPayload = finalTrades
-			}
+            tradesPayload := interface{}(snap.Trades)
+            var finalTrades []completedTrade
+            _ = readCachedJSONWithTimeout(r.Context(), cache, finalTradesKey, &finalTrades, 1200*time.Millisecond)
 
-			var liveBTCPayload interface{}
-			if err := readCachedJSONWithTimeout(r.Context(), cache, liveBTCKey, &liveBTCPayload, 1200*time.Millisecond); err != nil {
-				liveBTCPayload = map[string]interface{}{"warning": err.Error()}
-			}
+            var tradeCompletePayload interface{}
+            if err := readCachedJSONWithTimeout(r.Context(), cache, tradeCompleteKey, &tradeCompletePayload, 1200*time.Millisecond); err != nil {
+                if len(finalTrades) > 0 {
+                    tradeCompletePayload = finalTrades[len(finalTrades)-1]
+                } else {
+                    tradeCompletePayload = map[string]interface{}{"warning": err.Error()}
+                }
+            }
 
-			var pastOutcomesPayload interface{}
-			if err := readCachedJSONWithTimeout(r.Context(), cache, pastOutcomesKey, &pastOutcomesPayload, 1200*time.Millisecond); err != nil {
-				pastOutcomesPayload = map[string]interface{}{"warning": err.Error()}
-			}
+            var liveBTCPayload interface{}
+            if err := readCachedJSONWithTimeout(r.Context(), cache, liveBTCKey, &liveBTCPayload, 1200*time.Millisecond); err != nil {
+                liveBTCPayload = map[string]interface{}{"warning": err.Error()}
+            }
 
-			if snapErr != nil {
-				_ = conn.WriteJSON(streamEnvelope{
-					Type:      "error",
-					Timestamp: time.Now().UTC(),
-					Data: streamFrame{Signal: map[string]interface{}{"message": snapErr.Error()}},
-				})
-				select {
-				case <-r.Context().Done():
-					return
-				case <-ticker.C:
-					continue
-				}
-			}
+            var pastOutcomesPayload interface{}
+            if err := readCachedJSONWithTimeout(r.Context(), cache, pastOutcomesKey, &pastOutcomesPayload, 1200*time.Millisecond); err != nil {
+                pastOutcomesPayload = map[string]interface{}{"warning": err.Error()}
+            }
 
-			lastTradeStatus := "none"
-			if len(snap.Trades) > 0 {
-				lastTradeStatus = string(snap.Trades[0].Status)
-			}
+            if snapErr != nil {
+                _ = conn.WriteJSON(streamEnvelope{
+                    Type:      "error",
+                    Timestamp: time.Now().UTC(),
+                    Data: streamFrame{Signal: map[string]interface{}{"message": snapErr.Error()}},
+                })
+                select {
+                case <-r.Context().Done():
+                    return
+                case <-ticker.C:
+                    continue
+                }
+            }
 
-			marketSection := map[string]interface{}{
-				"polymarket_mid": nil,
-				"binance_mid":    nil,
-			}
-			signalSection := map[string]interface{}{
-				"action":          snap.Report.Action,
-				"risk_allowed":    snap.Report.RiskAllowed,
-				"tick_seq":        snap.Report.TickSeq,
-				"position_signal": "unknown",
-				"entry_signal":    false,
-				"exit_signal":     false,
-				"close_reason":    "none",
-			}
-			execSection := map[string]interface{}{
-				"open_trades":         snap.Report.OpenTrades,
-				"latest_trade_status": lastTradeStatus,
-			}
+            lastTradeStatus := "none"
+            if len(snap.Trades) > 0 {
+                lastTradeStatus = string(snap.Trades[0].Status)
+            }
 
-			if stateErr == nil {
-				marketSection["polymarket_mid"] = state.PolymarketMid
-				marketSection["polymarket_probability"] = state.PolymarketProb
-				marketSection["fair_value_probability"] = state.FairValueProb
-				marketSection["binance_mid"] = state.BinanceMid
-				marketSection["ts_ms"] = state.TSMs
+            marketSection := map[string]interface{}{
+                "polymarket_mid": nil,
+                "binance_mid":    nil,
+            }
+            signalSection := map[string]interface{}{
+                "action":          snap.Report.Action,
+                "risk_allowed":    snap.Report.RiskAllowed,
+                "tick_seq":        snap.Report.TickSeq,
+                "position_signal": "unknown",
+                "entry_signal":    false,
+                "exit_signal":     false,
+                "close_reason":    "none",
+            }
+            execSection := map[string]interface{}{
+                "open_trades":         snap.Report.OpenTrades,
+                "open_trades_runner":  snap.Report.OpenTrades,
+                "latest_trade_status": lastTradeStatus,
+            }
 
-				signalSection["edge_bps"] = state.EdgeBps
-				signalSection["net_edge_bps"] = state.NetEdgeBps
-				signalSection["direction"] = state.Direction
-				signalSection["risk_allowed"] = state.RiskAllowed
-				signalSection["position_signal"] = state.PositionSignal
-				signalSection["entry_signal"] = state.EntrySignal
-				signalSection["exit_signal"] = state.ExitSignal
-				signalSection["close_reason"] = state.CloseReason
+            portfolioSection := map[string]interface{}{
+                "net_qty":                   0.0,
+                "avg_entry":                 0.0,
+                "unrealized_pnl_usd":        0.0,
+                "realized_pnl_usd":          0.0,
+                "total_pnl_usd":             0.0,
+                "day":                       time.Now().UTC().Format("2006-01-02"),
+                "day_pnl_usd":               0.0,
+                "day_max_up_usd":            0.0,
+                "day_max_drop_usd":          0.0,
+                "all_time_realized_pnl_usd": 0.0,
+            }
 
-				execSection["execution_status"] = state.ExecutionStatus
-				execSection["open_positions"] = state.OpenPositions
-				execSection["day_pnl_usd"] = state.DayPnlUSD
-				execSection["portfolio_net_qty"] = state.PortfolioNetQty
-				execSection["portfolio_avg_entry"] = state.PortfolioAvgEntry
-				execSection["portfolio_unrealized_pnl_usd"] = state.PortfolioUnrealizedPnL
-				execSection["portfolio_total_pnl_usd"] = state.PortfolioTotalPnL
-			} else {
-				marketSection["warning"] = "trader state unavailable in redis"
-				signalSection["warning"] = stateErr.Error()
-			}
+            if stateErr == nil {
+                marketSection["polymarket_mid"] = state.PolymarketMid
+                marketSection["polymarket_probability"] = state.PolymarketProb
+                marketSection["fair_value_probability"] = state.FairValueProb
+                marketSection["binance_mid"] = state.BinanceMid
+                marketSection["ts_ms"] = state.TSMs
 
+                signalSection["edge_bps"] = state.EdgeBps
+                signalSection["net_edge_bps"] = state.NetEdgeBps
+                signalSection["direction"] = state.Direction
+                signalSection["risk_allowed"] = state.RiskAllowed
+                signalSection["position_signal"] = state.PositionSignal
+                signalSection["entry_signal"] = state.EntrySignal
+                signalSection["exit_signal"] = state.ExitSignal
+                signalSection["close_reason"] = state.CloseReason
+
+                execSection["execution_status"] = state.ExecutionStatus
+                execSection["open_positions"] = state.OpenPositions
+                execSection["open_trades"] = state.OpenPositions
+                execSection["day_pnl_usd"] = state.DayPnlUSD
+                portfolioSection["net_qty"] = state.PortfolioNetQty
+                portfolioSection["avg_entry"] = state.PortfolioAvgEntry
+                portfolioSection["unrealized_pnl_usd"] = state.PortfolioUnrealizedPnL
+                portfolioSection["realized_pnl_usd"] = state.PortfolioRealizedPnL
+                portfolioSection["total_pnl_usd"] = state.PortfolioTotalPnL
+                portfolioSection["all_time_realized_pnl_usd"] = state.PortfolioAllTimeRealizedPnL
+            } else {
+                marketSection["warning"] = "trader state unavailable in redis"
+                signalSection["warning"] = stateErr.Error()
+            }
+
+            history := make(map[string]portfolioDayStats)
+            if err := readCachedJSONWithTimeout(r.Context(), cache, portfolioDailyKey, &history, 1200*time.Millisecond); err != nil {
+                portfolioSection["daily_history"] = map[string]portfolioDayStats{}
+            } else {
+                portfolioSection["daily_history"] = history
+                todayKey := time.Now().UTC().Format("2006-01-02")
+                if todayStats, ok := history[todayKey]; ok {
+                    portfolioSection["day"] = todayStats.Day
+                    portfolioSection["day_pnl_usd"] = todayStats.DayPnLUSD
+                    portfolioSection["day_max_up_usd"] = todayStats.DayMaxUpUSD
+                    portfolioSection["day_max_drop_usd"] = todayStats.DayMaxDropUSD
+                    portfolioSection["today_stats"] = todayStats
+                }
+            }
 			env := streamEnvelope{
 				Type:      "snapshot",
 				Timestamp: time.Now().UTC(),
 				Data: streamFrame{
-					Snapshot:     snap,
-					Trades:       tradesPayload,
-					LiveBTC:      liveBTCPayload,
-					PastOutcomes: pastOutcomesPayload,
+					Snapshot:      snap,
+					Trades:        tradesPayload,
+					TradeComplete: tradeCompletePayload,
+					LiveBTC:       liveBTCPayload,
+					PastOutcomes:  pastOutcomesPayload,
 					Market:       marketSection,
 					Signal:       signalSection,
 					Execution:    execSection,
+					Portfolio:    portfolioSection,
 				},
 			}
 
@@ -389,6 +480,118 @@ func refreshRedisCache(
 	}
 }
 
+
+func syncPortfolioDailyToPostgres(
+	logger monitoring.Logger,
+	cache *storage.RedisCache,
+	db *storage.Client,
+	portfolioDailyKey string,
+) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		history := make(map[string]portfolioDayStats)
+		if err := cache.GetJSON(ctx, portfolioDailyKey, &history); err != nil {
+			cancel()
+			<-ticker.C
+			continue
+		}
+
+		for day, s := range history {
+			updatedMs := s.UpdatedAtMs
+			if updatedMs == 0 {
+				updatedMs = uint64(time.Now().UTC().UnixMilli())
+			}
+			rec := storage.PortfolioDayRecord{
+				Day:                day,
+				StartTotalPnLUSD:   s.StartTotalPnLUSD,
+				CurrentTotalPnLUSD: s.CurrentTotalPnL,
+				DayPnLUSD:          s.DayPnLUSD,
+				DayMaxUpUSD:        s.DayMaxUpUSD,
+				DayMaxDropUSD:      s.DayMaxDropUSD,
+				UpdatedAtMs:        updatedMs,
+			}
+			if err := db.UpsertPortfolioDaily(ctx, rec); err != nil {
+				logger.Warn("postgres upsert portfolio daily failed", map[string]interface{}{"error": err.Error(), "day": day})
+			}
+		}
+
+		cancel()
+		<-ticker.C
+	}
+}
+func syncTradeRecordsToPostgres(
+	logger monitoring.Logger,
+	cache *storage.RedisCache,
+	db *storage.Client,
+	completedTradesKey string,
+) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		completedTrades := make([]completedTrade, 0)
+		if err := cache.GetJSON(ctx, completedTradesKey, &completedTrades); err != nil {
+			cancel()
+			<-ticker.C
+			continue
+		}
+
+		for _, t := range completedTrades {
+			if strings.TrimSpace(t.ID) == "" {
+				continue
+			}
+
+			createdAt := time.UnixMilli(int64(t.EntryTSMs)).UTC()
+			updatedAt := time.UnixMilli(int64(t.ExitTSMs)).UTC()
+			if t.EntryTSMs == 0 {
+				createdAt = time.Now().UTC()
+			}
+			if t.ExitTSMs == 0 {
+				updatedAt = createdAt
+			}
+
+			rec := storage.TradeRecord{
+				ID:          t.ID,
+				Pair:        t.Pair,
+				Venue:       "polymarket",
+				Side:        t.ExitSide,
+				Quantity:    t.Quantity,
+				Price:       t.ExitPrice,
+				NotionalUSD: t.ExitNotionalUSD,
+				Status:      storage.TradeStatusFilled,
+				Metadata: map[string]string{
+					"direction":          t.Direction,
+					"entry_side":         t.EntrySide,
+					"exit_side":          t.ExitSide,
+					"entry_price":        strconv.FormatFloat(t.EntryPrice, 'f', -1, 64),
+					"exit_price":         strconv.FormatFloat(t.ExitPrice, 'f', -1, 64),
+					"entry_probability":  strconv.FormatFloat(t.EntryProbability, 'f', -1, 64),
+					"exit_probability":   strconv.FormatFloat(t.ExitProbability, 'f', -1, 64),
+					"entry_notional_usd": strconv.FormatFloat(t.EntryNotionalUSD, 'f', -1, 64),
+					"exit_notional_usd":  strconv.FormatFloat(t.ExitNotionalUSD, 'f', -1, 64),
+					"pnl_usd":            strconv.FormatFloat(t.PnlUSD, 'f', -1, 64),
+					"entry_ts_ms":        strconv.FormatUint(t.EntryTSMs, 10),
+					"exit_ts_ms":         strconv.FormatUint(t.ExitTSMs, 10),
+					"duration_ms":        strconv.FormatUint(t.DurationMs, 10),
+					"outcome":            t.Outcome,
+				},
+				CreatedAt: createdAt,
+				UpdatedAt: updatedAt,
+			}
+
+			if err := db.UpsertTradeRecord(ctx, rec); err != nil {
+				logger.Warn("postgres upsert completed trade failed", map[string]interface{}{"error": err.Error(), "trade_id": t.ID})
+			}
+		}
+
+		cancel()
+		<-ticker.C
+	}
+}
 func filterTrades(trades []storage.TradeRecord, status storage.TradeStatus) []storage.TradeRecord {
 	if status == "" {
 		return trades

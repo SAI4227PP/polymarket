@@ -27,6 +27,16 @@ type TradeRecord struct {
 	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
+type PortfolioDayRecord struct {
+	Day                string
+	StartTotalPnLUSD   float64
+	CurrentTotalPnLUSD float64
+	DayPnLUSD          float64
+	DayMaxUpUSD        float64
+	DayMaxDropUSD      float64
+	UpdatedAtMs        uint64
+}
+
 func (t *TradeRecord) Touch(now time.Time) {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = now
