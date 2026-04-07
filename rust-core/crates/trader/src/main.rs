@@ -274,6 +274,8 @@ async fn main() -> Result<()> {
     let mut oldest_quote_age_ms = 0u64;
     let mut current_5m_bucket_start_ms: Option<u64> = None;
     let mut current_5m_anchor_price = base_signal_cfg.anchor_price;
+    let mut kill_switch_latched = false;
+    let mut daily_loss_latched = false;
     let min_peak_pnl_for_drawdown_pct = env_f64("KILL_SWITCH_MIN_PEAK_PNL_USD", 5.0).max(0.0);
     let mut peak_total_pnl_usd = last_trader_state
         .as_ref()
@@ -283,8 +285,6 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|s| s.portfolio_drawdown_pct_from_peak)
         .unwrap_or(0.0);
-    let mut last_mark_price: Option<f64> = None;
-    let enforce_position_ttl = env_bool("ENFORCE_POSITION_TTL", false);
 
     let initial_open_trades_payload = build_open_trades(&pending_positions);
     if let Err(err) = publish_open_trades_to_redis(
@@ -341,18 +341,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        if enforce_position_ttl {
-            let closed = settle_expired_positions(
-                &mut pending_positions,
-                &mut day_pnl_usd,
-                &mut portfolio_realized_pnl_usd,
-                now_ms(),
-            );
-            if !closed.is_empty() {
-                trade_history.extend(closed);
-                trim_history(&mut trade_history, trade_history_limit);
-            }
-        }
         let open_positions = pending_positions.len();
         let open_direction = current_open_direction(&pending_positions);
         let current_gross_exposure_usd: f64 = pending_positions
@@ -363,6 +351,38 @@ async fn main() -> Result<()> {
             .iter()
             .map(|p| p.entry_notional_usd.abs())
             .fold(0.0, f64::max);
+
+        if should_kill(
+            KillSwitchState {
+                current_drawdown_pct,
+                error_streak,
+                oldest_quote_age_ms,
+            },
+            kill_cfg,
+        ) {
+            if !kill_switch_latched {
+                eprintln!(
+                    "kill switch latched drawdown_pct={:.2} error_streak={} stale_ms={} (no-new-entries mode)",
+                    current_drawdown_pct,
+                    error_streak,
+                    oldest_quote_age_ms
+                );
+            }
+            kill_switch_latched = true;
+        }
+
+        if day_pnl_usd <= -risk_limits.max_daily_loss_usd {
+            if !daily_loss_latched {
+                eprintln!(
+                    "daily loss latched day_pnl_usd={} limit={} (no-new-entries mode)",
+                    day_pnl_usd,
+                    -risk_limits.max_daily_loss_usd
+                );
+            }
+            daily_loss_latched = true;
+        }
+
+        let entries_latched = kill_switch_latched || daily_loss_latched;
 
         let iteration = run_iteration(
             &pm_rx,
@@ -380,6 +400,7 @@ async fn main() -> Result<()> {
             account_equity_usd,
             realized_vol_bps,
             kill_cfg.max_stale_data_ms,
+            entries_latched,
         )
         .await;
 
@@ -438,7 +459,6 @@ async fn main() -> Result<()> {
                 current_drawdown_pct =
                     pnl_drawdown_pct_from_peak(total_pnl_usd, peak_total_pnl_usd, min_peak_pnl_for_drawdown_pct);
                 state.portfolio_drawdown_pct_from_peak = current_drawdown_pct;
-                last_mark_price = Some(mark_price);
 
                 let day_key = utc_day_string(state.ts_ms);
                 update_daily_history(
@@ -515,70 +535,6 @@ async fn main() -> Result<()> {
         {
             eprintln!("redis trade-history publish error: {err:#}");
         }
-
-
-        if should_kill(
-            KillSwitchState {
-                current_drawdown_pct,
-                error_streak,
-                oldest_quote_age_ms,
-            },
-            kill_cfg,
-        ) {
-            if let Some(close_price) = last_mark_price {
-                let close_reason = format!("kill_switch_drawdown_{:.2}pct", current_drawdown_pct);
-                let close_ts_ms = now_ms();
-                let closed_now = close_positions_now(
-                    &mut pending_positions,
-                    &mut day_pnl_usd,
-                    &mut portfolio_realized_pnl_usd,
-                    close_price,
-                    close_ts_ms,
-                    &close_reason,
-                );
-                if !closed_now.is_empty() {
-                    trade_history.extend(closed_now);
-                    trim_history(&mut trade_history, trade_history_limit);
-
-                    if let Err(err) = publish_open_trades_to_redis(
-                        &redis_url,
-                        &redis_open_trades_key,
-                        &[],
-                        &mut redis_conn,
-                    )
-                    .await
-                    {
-                        eprintln!("redis open-trades publish on kill error: {err:#}");
-                    }
-
-                    if let Err(err) = publish_trades_to_redis(
-                        &redis_url,
-                        &redis_final_trades_key,
-                        &trade_history,
-                        &mut redis_conn,
-                    )
-                    .await
-                    {
-                        eprintln!("redis trade-history publish on kill error: {err:#}");
-                    }
-                }
-            }
-
-            return Err(anyhow!(
-                "kill switch triggered drawdown_pct={:.2} error_streak={} stale_ms={}",
-                current_drawdown_pct,
-                error_streak,
-                oldest_quote_age_ms
-            ));
-        }
-
-        if day_pnl_usd <= -risk_limits.max_daily_loss_usd {
-            return Err(anyhow!(
-                "daily loss threshold breached day_pnl_usd={} limit={} ",
-                day_pnl_usd,
-                -risk_limits.max_daily_loss_usd
-            ));
-        }
     }
 }
 
@@ -606,6 +562,7 @@ async fn run_iteration(
     account_equity_usd: f64,
     realized_vol_bps: f64,
     max_quote_age_ms: u64,
+    entries_latched: bool,
 ) -> Result<IterationOutcome> {
     let pm_quote = match pm_rx.borrow().clone() {
         Some(q) => q,
@@ -684,7 +641,7 @@ async fn run_iteration(
         account_equity_usd,
     );
 
-    let can_open_new_position = !has_open_positions;
+    let can_open_new_position = !has_open_positions && !entries_latched;
     let candidate_intent = if can_open_new_position
         && pm_fresh
         && bn_fresh
@@ -724,6 +681,12 @@ async fn run_iteration(
             },
             risk_limits,
         )
+    } else if entries_latched && !has_open_positions {
+        RiskDecision {
+            allowed: false,
+            reason: "risk latched: entries disabled".to_string(),
+            violations: Vec::new(),
+        }
     } else {
         RiskDecision {
             allowed: true,
@@ -743,7 +706,9 @@ async fn run_iteration(
         .map(|o| o.quantity * o.limit_price)
         .unwrap_or(0.0);
     let mut report = order_manager::submit_if_needed(intent);
-    if !report.accepted && can_open_new_position && blocked_first_seconds_5m {
+    if !report.accepted && entries_latched && !has_open_positions {
+        report.status = "skipped:risk_latched_no_new_entries".to_string();
+    } else if !report.accepted && can_open_new_position && blocked_first_seconds_5m {
         report.status = format!(
             "skipped:first_seconds_5m_guard elapsed_s<{}",
             no_entry_first_seconds_5m
@@ -803,10 +768,6 @@ async fn run_iteration(
 
     let mut close_reason = if reversal_signal {
         Some("reverse_signal".to_string())
-    } else if has_open_positions && !pm_fresh {
-        Some("stale_polymarket".to_string())
-    } else if has_open_positions && !bn_fresh {
-        Some("stale_binance".to_string())
     } else if has_open_positions && !same_direction_hold && (weak_edge_invalidation || no_trade_signal) {
         Some("signal_invalidated".to_string())
     } else if has_open_positions && invalidation_deadband_hold {
@@ -844,6 +805,8 @@ async fn run_iteration(
         "hold_stale_polymarket"
     } else if !bn_fresh {
         "hold_stale_binance_depth"
+    } else if entries_latched && !has_open_positions {
+        "risk_latched_no_new_entries"
     } else if blocked_first_seconds_5m && can_open_new_position {
         "hold_first_seconds_5m_guard"
     } else if blocked_last_seconds_5m && can_open_new_position {
@@ -1530,57 +1493,6 @@ fn position_pnl_usd(direction: TradeDirection, quantity: f64, entry_price: f64, 
         TradeDirection::Flat => 0.0,
     }
 }
-fn settle_expired_positions(
-    pending_positions: &mut Vec<PendingPosition>,
-    day_pnl_usd: &mut f64,
-    portfolio_realized_pnl_usd: &mut f64,
-    now_ms: u64,
-) -> Vec<CompletedTrade> {
-    let mut keep = Vec::with_capacity(pending_positions.len());
-    let mut closed = Vec::new();
-
-    for pos in pending_positions.drain(..) {
-        if pos.settle_at_ms <= now_ms {
-            *day_pnl_usd += pos.expected_pnl_usd;
-            *portfolio_realized_pnl_usd += pos.expected_pnl_usd;
-            let exit_notional_usd = (pos.entry_notional_usd + pos.expected_pnl_usd).max(0.0);
-            let exit_price = if pos.quantity > 0.0 {
-                exit_notional_usd / pos.quantity
-            } else {
-                pos.entry_price
-            };
-
-            closed.push(CompletedTrade {
-                id: pos.id,
-                pair: "BTC".to_string(),
-                direction: format!("{:?}", pos.direction),
-                entry_side: entry_side_for_direction(pos.direction).to_string(),
-                exit_side: exit_side_for_direction(pos.direction).to_string(),
-                quantity: pos.quantity,
-                entry_price: pos.entry_price,
-                exit_price,
-                entry_probability: pos.entry_price.clamp(0.0, 1.0),
-                exit_probability: exit_price.clamp(0.0, 1.0),
-                entry_notional_usd: pos.entry_notional_usd,
-                exit_notional_usd,
-                pnl_usd: pos.expected_pnl_usd,
-                entry_ts_ms: pos.entry_ts_ms,
-                exit_ts_ms: now_ms,
-                duration_ms: now_ms.saturating_sub(pos.entry_ts_ms),
-                outcome: if pos.expected_pnl_usd >= 0.0 {
-                    "profit".to_string()
-                } else {
-                    "loss".to_string()
-                },
-            });
-        } else {
-            keep.push(pos);
-        }
-    }
-
-    *pending_positions = keep;
-    closed
-}
 
 fn trim_history(history: &mut Vec<CompletedTrade>, max_len: usize) {
     if max_len == 0 {
@@ -1765,6 +1677,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("iteration 1 should succeed");
@@ -1800,6 +1713,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("iteration 2 should succeed");
@@ -1847,6 +1761,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("iteration 3 should succeed");
@@ -1883,6 +1798,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("open iteration should succeed");
@@ -1908,6 +1824,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("hold iteration should succeed");
@@ -1942,6 +1859,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("iteration should succeed");
@@ -1981,6 +1899,7 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("open iteration should succeed");
@@ -2008,12 +1927,109 @@ mod tests {
             100.0,
             30.0,
             60_000,
+            false,
         )
         .await
         .expect("hold iteration should succeed");
 
         assert!(!hold.close_open_positions, "deadband should avoid churn close");
         assert!(hold.position.is_none(), "no second position while one is open");
+    }
+
+    #[tokio::test]
+    async fn risk_latched_blocks_new_entries() {
+        let now = now_ms();
+        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
+
+        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
+
+        let out = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            0.0,
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+            true,
+        )
+        .await
+        .expect("iteration should succeed");
+
+        assert!(out.position.is_none(), "risk latch should block new entries");
+        assert_eq!(out.state.action, "risk_latched_no_new_entries");
+        assert_eq!(out.state.execution_status, "skipped:risk_latched_no_new_entries");
+    }
+
+    #[tokio::test]
+    async fn stale_quotes_do_not_force_close_by_themselves() {
+        let now = now_ms();
+        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
+
+        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
+
+        let opened = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            0,
+            None,
+            0.0,
+            0.0,
+            5_000,
+            100.0,
+            30.0,
+            60_000,
+            false,
+        )
+        .await
+        .expect("open iteration should succeed");
+
+        let pos = opened.position.expect("expected initial position");
+
+        let stale_ts = now.saturating_sub(5_000);
+        pm_tx.send_replace(Some(q("polymarket", pos.entry_price, stale_ts)));
+        bn_tx.send_replace(Some(q("binance", 100_000.0, stale_ts)));
+
+        let hold = run_iteration(
+            &pm_rx,
+            &bn_rx,
+            test_signal_cfg(),
+            test_risk_limits(),
+            test_execution_cfg(),
+            10.0,
+            0.0,
+            1,
+            Some(pos.direction),
+            pos.entry_notional_usd.abs(),
+            pos.entry_notional_usd.abs(),
+            5_000,
+            100.0,
+            30.0,
+            100,
+            false,
+        )
+        .await
+        .expect("hold iteration should succeed");
+
+        assert!(!hold.close_open_positions, "stale quotes alone must not force close");
+        assert!(hold.close_reason.is_none(), "no stale-based close reason expected");
     }
 
     #[test]
@@ -2043,9 +2059,3 @@ mod tests {
         assert_eq!(five_min_bucket_start_ms(600_000), 600_000);
     }
 }
-
-
-
-
-
-
