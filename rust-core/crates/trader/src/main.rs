@@ -278,15 +278,16 @@ async fn main() -> Result<()> {
     let mut kill_switch_latched = false;
     let mut transient_kill_blocked_prev = false;
     let mut daily_loss_latched = false;
+    let mut current_day_key = today_key.clone();
     let min_peak_pnl_for_drawdown_pct = env_f64("KILL_SWITCH_MIN_PEAK_PNL_USD", 5.0).max(0.0);
     let mut peak_total_pnl_usd = last_trader_state
         .as_ref()
         .map(|s| s.portfolio_total_pnl_usd)
         .unwrap_or(0.0);
-    let mut current_drawdown_pct = last_trader_state
-        .as_ref()
-        .map(|s| s.portfolio_drawdown_pct_from_peak)
-        .unwrap_or(0.0);
+    // Do not restore persisted drawdown percentage directly on boot. A stale value can
+    // re-latch entries immediately before we recompute drawdown from the current runtime
+    // equity curve, leaving the runner stuck in no-new-entries mode after restart.
+    let mut current_drawdown_pct = 0.0;
 
     let initial_open_trades_payload = build_open_trades(&pending_positions);
     if let Err(err) = publish_open_trades_to_redis(
@@ -316,6 +317,22 @@ async fn main() -> Result<()> {
 
     loop {
         ticker.tick().await;
+        let loop_day_key = utc_day_string(now_ms());
+        if loop_day_key != current_day_key {
+            current_day_key = loop_day_key.clone();
+            day_pnl_usd = portfolio_daily_history
+                .get(&loop_day_key)
+                .map(|s| s.day_pnl_usd)
+                .unwrap_or(0.0);
+            if daily_loss_latched {
+                eprintln!(
+                    "daily loss latch cleared on day rollover (new day: {}, day_pnl_usd={})",
+                    loop_day_key,
+                    day_pnl_usd
+                );
+            }
+            daily_loss_latched = false;
+        }
         let pm_snapshot = pm_rx.borrow().clone();
         let bn_snapshot = bn_rx.borrow().clone();
         if let Some(bnq) = bn_snapshot.as_ref() {
@@ -398,6 +415,27 @@ async fn main() -> Result<()> {
         }
 
         let entries_latched = kill_switch_latched || daily_loss_latched || transient_kill_blocked;
+        let entry_block_reason = if kill_switch_latched {
+            Some(format!(
+                "kill_switch_latched_drawdown drawdown_pct={:.2} threshold_pct={:.2}",
+                current_drawdown_pct, kill_cfg.max_drawdown_pct
+            ))
+        } else if daily_loss_latched {
+            Some(format!(
+                "daily_loss_latched day_pnl_usd={:.4} limit_usd={:.4}",
+                day_pnl_usd, risk_limits.max_daily_loss_usd
+            ))
+        } else if transient_kill_blocked {
+            Some(format!(
+                "kill_switch_temporary error_streak={} stale_ms={} thresholds(error_streak={},stale_ms={})",
+                error_streak,
+                oldest_quote_age_ms,
+                kill_cfg.max_error_streak,
+                kill_cfg.max_stale_data_ms
+            ))
+        } else {
+            None
+        };
 
         let iteration = run_iteration(
             &pm_rx,
@@ -428,6 +466,16 @@ async fn main() -> Result<()> {
             }) => {
                 error_streak = 0;
                 oldest_quote_age_ms = state.oldest_quote_age_ms;
+                let mut state = state;
+                if state.action == "entries_blocked_no_new_entries" {
+                    if let Some(reason) = entry_block_reason.as_ref() {
+                        state.risk_reason = reason.clone();
+                        state.execution_status = format!(
+                            "skipped:entries_blocked_no_new_entries {}",
+                            reason
+                        );
+                    }
+                }
 
                 if close_open_positions {
                     let close_ts_ms = now_ms();
@@ -448,8 +496,6 @@ async fn main() -> Result<()> {
                 if let Some(pos) = position {
                     pending_positions.push(pos);
                 }
-
-                let mut state = state;
                 let portfolio_position = build_portfolio_position(&pending_positions);
                 let mark_price = state.polymarket_mid.clamp(0.0, 1.0);
                 let unrealized_pnl_usd = unrealized_pnl(portfolio_position.avg_price, mark_price, portfolio_position.qty);
