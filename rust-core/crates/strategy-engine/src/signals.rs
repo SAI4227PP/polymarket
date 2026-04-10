@@ -1,7 +1,7 @@
 use common::{Quote, Signal, TradeDirection};
 
 use crate::arbitrage::{expected_edge_after_costs, CostModel};
-use crate::fair_value::{blended_fair_value, fair_value_with_basis};
+use crate::fair_value::{blended_fair_value, dynamic_blend_weight, fair_value_advanced};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SignalConfig {
@@ -21,6 +21,10 @@ pub struct SignalConfig {
     pub divergence_penalty_bps_per_100: f64,
     pub min_liquidity_score: f64,
     pub direction_mismatch_penalty_bps: f64,
+    pub fair_value_horizon_ms: u64,
+    pub fair_value_vol_floor_bps: f64,
+    pub blend_max_divergence_bps: f64,
+    pub micro_bias_cap_bps: f64,
 }
 
 impl Default for SignalConfig {
@@ -42,6 +46,10 @@ impl Default for SignalConfig {
             divergence_penalty_bps_per_100: 2.5,
             min_liquidity_score: 0.15,
             direction_mismatch_penalty_bps: 8.0,
+            fair_value_horizon_ms: 300_000,
+            fair_value_vol_floor_bps: 20.0,
+            blend_max_divergence_bps: 350.0,
+            micro_bias_cap_bps: 12.0,
         }
     }
 }
@@ -56,33 +64,38 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
         };
     }
 
-    let model_fv = fair_value_with_basis(bn, cfg.basis_bps, cfg.anchor_price);
-    let market_fv = pm.price;
-
-    let micro_bias_bps = (bn.spread_bps() - pm.spread_bps()).clamp(-10.0, 10.0) * 0.2;
-    let fair_value = blended_fair_value(
-        model_fv,
-        market_fv,
-        cfg.microstructure_model_weight,
-        micro_bias_bps,
-    );
-
-    let gross_edge = fair_value - pm.price;
-    let gross_edge_bps_signed = gross_edge * 10_000.0;
+    let now_ms = now_ms();
+    let oldest_quote_age_ms = quote_age_ms(now_ms, pm.ts_ms).max(quote_age_ms(now_ms, bn.ts_ms));
 
     let pm_spread = pm.spread_bps();
     let bn_spread = bn.spread_bps();
-    let spread_penalty = ((pm_spread + bn_spread) * 0.5).max(cfg.spread_guard_bps * 0.25);
-
-    let now_ms = now_ms();
-    let oldest_quote_age_ms = quote_age_ms(now_ms, pm.ts_ms).max(quote_age_ms(now_ms, bn.ts_ms));
-    let age_penalty = if oldest_quote_age_ms > cfg.max_quote_age_ms {
-        cfg.stale_penalty_bps
-    } else {
-        0.0
-    };
-
     let liquidity_score = (1.0 - (pm_spread / cfg.spread_guard_bps).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
+    let modeled_vol_bps = cfg.regime_vol_bps.abs().max(cfg.fair_value_vol_floor_bps);
+    let model_fv = fair_value_advanced(
+        bn.price,
+        cfg.anchor_price,
+        cfg.basis_bps,
+        modeled_vol_bps,
+        oldest_quote_age_ms,
+        cfg.fair_value_horizon_ms,
+    );
+
+    let market_fv = pm.price;
+    let model_market_divergence_bps = (model_fv - market_fv).abs() * 10_000.0;
+    let adaptive_model_weight = dynamic_blend_weight(
+        cfg.microstructure_model_weight,
+        model_market_divergence_bps,
+        cfg.blend_max_divergence_bps,
+        liquidity_score,
+    );
+
+    let micro_bias_bps = ((bn_spread - pm_spread) * 0.2)
+        .clamp(-cfg.micro_bias_cap_bps.abs(), cfg.micro_bias_cap_bps.abs());
+    let fair_value = blended_fair_value(model_fv, market_fv, adaptive_model_weight, micro_bias_bps);
+
+    let gross_edge = fair_value - pm.price;
+    let gross_edge_bps_signed = gross_edge * 10_000.0;
     let gross_edge_bps = gross_edge_bps_signed.abs();
 
     let mut net_edge_bps = expected_edge_after_costs(
@@ -91,11 +104,19 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
         liquidity_score,
         oldest_quote_age_ms,
         cfg.alpha_half_life_ms,
+        pm.price,
         cfg.costs,
     );
 
+    let spread_penalty = ((pm_spread + bn_spread) * 0.5).max(cfg.spread_guard_bps * 0.25);
+    net_edge_bps -= spread_penalty;
+
+    let age_ratio = (oldest_quote_age_ms as f64 / cfg.max_quote_age_ms.max(1) as f64).clamp(0.0, 3.0);
+    let age_penalty = cfg.stale_penalty_bps.max(0.0) * age_ratio;
+    net_edge_bps -= age_penalty;
+
     let vol_penalty = (cfg.regime_vol_bps / 100.0).clamp(0.0, 10.0);
-    net_edge_bps -= spread_penalty + age_penalty + vol_penalty;
+    net_edge_bps -= vol_penalty;
 
     let model_side = side_from_prob(model_fv, cfg.no_trade_band_bps);
     let market_side = side_from_prob(pm.price, cfg.no_trade_band_bps);
@@ -103,9 +124,8 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
         net_edge_bps -= cfg.direction_mismatch_penalty_bps.max(0.0);
     }
 
-    let divergence_bps = (model_fv - pm.price).abs() * 10_000.0;
-    let divergence_over_100 = (divergence_bps / 100.0).max(0.0);
-    net_edge_bps -= divergence_over_100 * cfg.divergence_penalty_bps_per_100.max(0.0);
+    let divergence_excess_bps = (model_market_divergence_bps - cfg.no_trade_band_bps.max(0.0)).max(0.0);
+    net_edge_bps -= (divergence_excess_bps / 100.0) * cfg.divergence_penalty_bps_per_100.max(0.0);
 
     let direction = if gross_edge_bps_signed > 0.0 {
         TradeDirection::Up
@@ -117,7 +137,7 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
 
     let adaptive_threshold = cfg.min_edge_bps + (pm_spread + bn_spread) * 0.15 + vol_penalty;
     let no_trade_band = model_side == 0 && market_side == 0;
-    let stale_divergence = divergence_bps > cfg.max_model_market_divergence_bps.max(0.0);
+    let stale_divergence = model_market_divergence_bps > cfg.max_model_market_divergence_bps.max(0.0);
     let too_thin_liquidity = liquidity_score < cfg.min_liquidity_score.clamp(0.0, 1.0);
 
     Signal {
@@ -155,4 +175,3 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
