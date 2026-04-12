@@ -534,9 +534,8 @@ fn is_market_ws_payload_relevant(
         .get("market")
         .and_then(Value::as_str)
         .or_else(|| obj.get("condition_id").and_then(Value::as_str));
-    if !subscription.accepts_market(market) {
-        return false;
-    }
+    let market_matches = subscription.accepts_market(market);
+    let market_mode = matches!(subscription.mode, InstrumentMode::Market);
 
     match event_type {
         "price_change" => {
@@ -545,27 +544,33 @@ fn is_market_ws_payload_relevant(
                 None => return false,
             };
             levels.iter().any(|lvl| {
-                lvl.get("asset_id")
+                let asset_ok = lvl
+                    .get("asset_id")
                     .and_then(Value::as_str)
                     .map(|asset| subscription.accepts_asset(asset, preferred_asset))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                asset_ok && (market_matches || market_mode)
             })
         }
         "new_market" | "market_resolved" => {
             if let Some(assets) = obj.get("assets_ids").and_then(Value::as_array) {
-                return assets.iter().any(|v| {
+                let asset_ok = assets.iter().any(|v| {
                     v.as_str()
                         .map(|asset| subscription.accepts_asset(asset, preferred_asset))
                         .unwrap_or(false)
                 });
+                return asset_ok && (market_matches || market_mode);
             }
-            true
+            market_matches
         }
-        "book" | "best_bid_ask" | "last_trade_price" | "tick_size_change" => obj
+        "book" | "best_bid_ask" | "last_trade_price" | "tick_size_change" => {
+            let asset_ok = obj
             .get("asset_id")
             .and_then(Value::as_str)
             .map(|asset| subscription.accepts_asset(asset, preferred_asset))
-            .unwrap_or(false),
+            .unwrap_or(false);
+            asset_ok && (market_matches || market_mode)
+        }
         _ => false,
     }
 }
@@ -673,19 +678,7 @@ pub async fn fetch_market_outcome_payload_from_env() -> Result<Value> {
     let base = std::env::var("POLYMARKET_GAMMA_API_URL")
         .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
     let base = base.trim_end_matches('/');
-    let url = format!("{base}/markets/{market_id}");
-
-    let market: Value = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .with_context(|| format!("gamma market request failed: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("gamma market request non-success: {url}"))?
-        .json()
-        .await
-        .with_context(|| format!("gamma market decode failed: {url}"))?;
+    let market = fetch_gamma_market_payload(&base, &market_id).await?;
 
     let outcomes = parse_market_outcome_labels(&market);
     let prices = parse_market_outcome_prices(&market);
@@ -732,6 +725,49 @@ pub async fn fetch_market_outcome_payload_from_env() -> Result<Value> {
         "source": "official_gamma_api_markets",
         "ts_ms": now_ms(),
     }))
+}
+
+async fn fetch_gamma_market_payload(base: &str, market_id: &str) -> Result<Value> {
+    let client = reqwest::Client::new();
+    let mut errors = Vec::new();
+    let urls = [
+        format!("{base}/markets/{market_id}"),
+        format!("{base}/markets?id={market_id}"),
+        format!("{base}/markets?condition_id={market_id}"),
+        format!("{base}/markets?conditionId={market_id}"),
+    ];
+
+    for url in urls {
+        match fetch_one_gamma_market_payload(&client, &url).await {
+            Ok(v) => return Ok(v),
+            Err(err) => errors.push(format!("{url}: {err:#}")),
+        }
+    }
+
+    bail!("gamma market lookup failed for {market_id}: {}", errors.join(" | "));
+}
+
+async fn fetch_one_gamma_market_payload(client: &reqwest::Client, url: &str) -> Result<Value> {
+    let payload: Value = client
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma market request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma market request non-success: {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("gamma market decode failed: {url}"))?;
+
+    match payload {
+        Value::Object(_) => Ok(payload),
+        Value::Array(items) => items
+            .into_iter()
+            .find(|item| item.is_object())
+            .context("gamma market payload array missing object market"),
+        _ => bail!("gamma market payload is neither object nor array"),
+    }
 }
 
 fn auto_today_event_slug() -> String {
