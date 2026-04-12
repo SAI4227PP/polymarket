@@ -194,7 +194,7 @@ impl PolymarketClient {
             .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string());
         let url = Url::parse(&ws_url).context("invalid POLYMARKET_USER_WS_URL")?;
 
-        let (mut socket, _) = connect_async(url)
+        let (mut socket, _) = connect_async(url.as_str())
             .await
             .context("failed to connect to polymarket user websocket")?;
 
