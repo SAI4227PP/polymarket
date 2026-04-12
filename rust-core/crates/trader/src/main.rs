@@ -637,6 +637,7 @@ async fn main() -> Result<()> {
         let iteration = run_iteration(
             &pm_rx,
             &bn_rx,
+            chainlink_snapshot.clone(),
             signal_cfg,
             risk_limits,
             execution_cfg,
@@ -874,6 +875,7 @@ struct IterationOutcome {
 async fn run_iteration(
     pm_rx: &watch::Receiver<Option<Quote>>,
     bn_rx: &watch::Receiver<Option<Quote>>,
+    chainlink_quote: Option<Quote>,
     signal_cfg: SignalConfig,
     risk_limits: RiskLimits,
     execution_cfg: ExecutionConfig,
@@ -896,10 +898,14 @@ async fn run_iteration(
         Some(q) => q,
         None => {
             eprintln!("waiting for polymarket quote...");
+            let mut state = waiting_state(day_pnl_usd, open_positions);
+            state.action = "waiting_polymarket_quote".to_string();
+            state.risk_reason = "waiting_polymarket_quote".to_string();
+            state.execution_status = "waiting:polymarket_quote_missing".to_string();
             return Ok(IterationOutcome {
                 position: None,
                 pending_live_submission: None,
-                state: waiting_state(day_pnl_usd, open_positions),
+                state,
                 close_open_positions: false,
                 close_reason: None,
             });
@@ -919,14 +925,18 @@ async fn run_iteration(
         });
     }
 
-    let bn_quote = match bn_rx.borrow().clone() {
+    let bn_quote = match bn_rx.borrow().clone().or(chainlink_quote) {
         Some(q) => q,
         None => {
             eprintln!("waiting for binance quote...");
+            let mut state = waiting_state(day_pnl_usd, open_positions);
+            state.action = "waiting_binance_quote".to_string();
+            state.risk_reason = "waiting_binance_quote".to_string();
+            state.execution_status = "waiting:binance_quote_missing".to_string();
             return Ok(IterationOutcome {
                 position: None,
                 pending_live_submission: None,
-                state: waiting_state(day_pnl_usd, open_positions),
+                state,
                 close_open_positions: false,
                 close_reason: None,
             });
@@ -1815,61 +1825,64 @@ fn spawn_chainlink_reference_stream(tx: watch::Sender<Option<Quote>>) {
 
 fn spawn_polymarket_stream(tx: watch::Sender<Option<Quote>>) {
     tokio::spawn(async move {
-        let mut last_instrument: Option<String> = None;
-        let mut last_source: Option<String> = None;
+        let mut active_instrument: Option<String> = None;
+        let mut active_source: Option<String> = None;
 
         loop {
-            let resolved = match polymarket_ws::resolve_instrument_from_env().await {
-                Ok(v) => v,
-                Err(err) => {
-                    eprintln!("polymarket resolve error: {err:#}");
-                    sleep(Duration::from_millis(1000)).await;
+            if active_instrument.is_none() {
+                let resolved = match polymarket_ws::resolve_instrument_from_env().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("polymarket resolve error: {err:#}");
+                        sleep(Duration::from_millis(1000)).await;
+                        continue;
+                    }
+                };
+                active_instrument = Some(resolved.instrument_id);
+                active_source = Some(resolved.source);
+            }
+
+            let instrument_id = match active_instrument.as_ref() {
+                Some(v) => v.clone(),
+                None => {
+                    sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             };
-
-            let instrument_id = resolved.instrument_id;
-            let source = resolved.source;
-
-            if last_instrument.as_deref() != Some(instrument_id.as_str()) {
-                if let (Some(prev_market), Some(prev_source)) = (last_instrument.as_ref(), last_source.as_ref()) {
-                    let prev_bucket = extract_5m_bucket(prev_source).or_else(|| extract_5m_bucket(prev_market));
-                    let new_bucket = extract_5m_bucket(&source).or_else(|| extract_5m_bucket(&instrument_id));
-                    eprintln!(
-                        "polymarket 5m transition resolved_previous_bucket={:?} previous_market={} -> new_bucket={:?} new_market={}",
-                        prev_bucket, prev_market, new_bucket, instrument_id
-                    );
-                }
-
-                eprintln!(
-                    "polymarket rollover subscribe instrument={} source={}",
-                    instrument_id, source
-                );
-                last_instrument = Some(instrument_id.clone());
-                last_source = Some(source.clone());
-            }
+            let source = active_source
+                .clone()
+                .unwrap_or_else(|| "unknown_source".to_string());
+            eprintln!(
+                "polymarket market subscribe instrument={} source={}",
+                instrument_id, source
+            );
 
             let tx_clone = tx.clone();
             let instrument_for_task = instrument_id.clone();
-            let mut stream_task = tokio::spawn(async move {
+            let stream_task = tokio::spawn(async move {
                 polymarket_ws::run_market_quote_stream(&instrument_for_task, tx_clone).await
             });
-
-            let rollover_wait = next_polymarket_rollover_wait();
-            tokio::pin!(rollover_wait);
-
-            tokio::select! {
-                task_res = &mut stream_task => {
-                    match task_res {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => eprintln!("polymarket stream error: {err:#}"),
-                        Err(err) => eprintln!("polymarket stream task join error: {err}"),
-                    }
+            match stream_task.await {
+                Ok(Ok(())) => {
+                    let prev_bucket = extract_5m_bucket(&source).or_else(|| extract_5m_bucket(&instrument_id));
+                    eprintln!(
+                        "polymarket market resolved instrument={} bucket={:?}; moving to next market",
+                        instrument_id, prev_bucket
+                    );
+                    active_instrument = None;
+                    active_source = None;
                 }
-                _ = &mut rollover_wait => {
-                    eprintln!("polymarket rollover boundary reached; re-resolving market");
-                    stream_task.abort();
-                    let _ = stream_task.await;
+                Ok(Err(err)) => {
+                    eprintln!(
+                        "polymarket stream error for active instrument={} (will retry same market): {err:#}",
+                        instrument_id
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "polymarket stream task join error for active instrument={} (will retry same market): {err}",
+                        instrument_id
+                    );
                 }
             }
 
@@ -1903,20 +1916,6 @@ fn spawn_polymarket_user_stream() {
 fn extract_5m_bucket(value: &str) -> Option<i64> {
     let token = value.split('-').next_back()?.trim();
     token.parse::<i64>().ok()
-}
-
-async fn next_polymarket_rollover_wait() {
-    let mode = std::env::var("POLYMARKET_AUTO_EVENT_MODE").unwrap_or_default();
-    if mode.eq_ignore_ascii_case("epoch_5m") {
-        let now_ms = now_ms();
-        let period_ms = 300_000_u64;
-        let next_boundary_ms = ((now_ms / period_ms) + 1) * period_ms + 1200;
-        let wait_ms = next_boundary_ms.saturating_sub(now_ms).max(500);
-        sleep(Duration::from_millis(wait_ms)).await;
-        return;
-    }
-
-    sleep(Duration::from_secs(300)).await;
 }
 
 fn build_portfolio_position(pending_positions: &[PendingPosition]) -> Position {

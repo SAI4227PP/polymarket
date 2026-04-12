@@ -570,6 +570,39 @@ fn is_market_ws_payload_relevant(
     }
 }
 
+fn payload_contains_market_resolved_event(
+    payload: &Value,
+    subscription: &MarketSubscription,
+    preferred_asset: Option<&str>,
+) -> bool {
+    match payload {
+        Value::Array(items) => items.iter().any(|item| {
+            item.as_object()
+                .and_then(|obj| obj.get("event_type"))
+                .and_then(Value::as_str)
+                .map(|event_type| {
+                    event_type == "market_resolved"
+                        && is_market_ws_payload_relevant(
+                            item,
+                            subscription,
+                            preferred_asset,
+                            "inbound",
+                        )
+                })
+                .unwrap_or(false)
+        }),
+        Value::Object(obj) => obj
+            .get("event_type")
+            .and_then(Value::as_str)
+            .map(|event_type| {
+                event_type == "market_resolved"
+                    && is_market_ws_payload_relevant(payload, subscription, preferred_asset, "inbound")
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 async fn resolve_market_metadata_by_event_slug(
     event_slug: &str,
     preferred_market_slug: Option<&str>,
@@ -1077,6 +1110,19 @@ async fn run_market_quote_stream_from_endpoint(
                     endpoint,
                     debug_ws,
                 );
+
+                if payload_contains_market_resolved_event(
+                    &payload,
+                    &subscription,
+                    preferred_asset.as_deref(),
+                ) {
+                    eprintln!(
+                        "polymarket market_resolved received for instrument={} endpoint={}; re-resolving next market",
+                        instrument_id,
+                        endpoint
+                    );
+                    return Ok(());
+                }
 
                 if let Some(quote) = parse_quote_from_payload(
                     &payload,
