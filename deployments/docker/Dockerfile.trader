@@ -8,7 +8,6 @@ COPY rust-core/crates rust-core/crates
 WORKDIR /workspace/rust-core
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/workspace/rust-core/target \
     cargo build --release -p trader \
     && cp /workspace/rust-core/target/release/trader /tmp/trader
 
