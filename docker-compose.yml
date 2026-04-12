@@ -36,7 +36,7 @@ services:
       REDIS_URL: redis://redis:6379
       POLYMARKET_AUTO_EVENT_PREFIX: btc-updown-5m
       POLYMARKET_AUTO_EVENT_MODE: epoch_5m
-      POLYMARKET_MARKET_WS_URL: wss://ws-subscriptions-frontend-clob.polymarket.com/ws/market
+      POLYMARKET_MARKET_WS_URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
       POLYMARKET_GAMMA_API_URL: https://gamma-api.polymarket.com
       POLYMARKET_WS_DEBUG: "1"
       TRADER_DEBUG_QUOTES: "1"

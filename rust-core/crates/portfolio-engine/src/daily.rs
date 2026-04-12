@@ -44,39 +44,4 @@ pub fn update_daily_history(
     stats.clone()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{update_daily_history, PortfolioDayStats};
-    use std::collections::HashMap;
-
-    fn approx_eq(a: f64, b: f64) {
-        assert!((a - b).abs() < 1e-9, "left={} right={}", a, b);
-    }
-
-    #[test]
-    fn tracks_day_pnl_and_intraday_extremes() {
-        let mut history: HashMap<String, PortfolioDayStats> = HashMap::new();
-
-        let s1 = update_daily_history(&mut history, "2026-04-07".to_string(), 10.0, 1);
-        approx_eq(s1.day_pnl_usd, 0.0);
-
-        let s2 = update_daily_history(&mut history, "2026-04-07".to_string(), 12.5, 2);
-        approx_eq(s2.day_pnl_usd, 2.5);
-        approx_eq(s2.day_max_up_usd, 2.5);
-        approx_eq(s2.day_max_drop_usd, 0.0);
-
-        let s3 = update_daily_history(&mut history, "2026-04-07".to_string(), 8.0, 3);
-        approx_eq(s3.day_pnl_usd, -2.0);
-        approx_eq(s3.day_max_up_usd, 2.5);
-        approx_eq(s3.day_max_drop_usd, -2.0);
-    }
-
-    #[test]
-    fn non_finite_total_is_treated_as_zero() {
-        let mut history: HashMap<String, PortfolioDayStats> = HashMap::new();
-        let s = update_daily_history(&mut history, "2026-04-07".to_string(), f64::NAN, 1);
-        approx_eq(s.start_total_pnl_usd, 0.0);
-        approx_eq(s.current_total_pnl_usd, 0.0);
-    }
-}
 

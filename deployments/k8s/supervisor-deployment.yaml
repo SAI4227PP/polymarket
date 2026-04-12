@@ -20,3 +20,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: polymarket-config
+            - secretRef:
+                name: polymarket-secrets
+

@@ -25,6 +25,8 @@ pub struct SignalConfig {
     pub fair_value_vol_floor_bps: f64,
     pub blend_max_divergence_bps: f64,
     pub micro_bias_cap_bps: f64,
+    pub polymarket_fees_enabled: bool,
+    pub polymarket_fee_rate: f64,
 }
 
 impl Default for SignalConfig {
@@ -50,6 +52,9 @@ impl Default for SignalConfig {
             fair_value_vol_floor_bps: 20.0,
             blend_max_divergence_bps: 350.0,
             micro_bias_cap_bps: 12.0,
+            polymarket_fees_enabled: true,
+            // Docs list crypto fee rate as 0.072 in fee formula C * rate * p * (1-p).
+            polymarket_fee_rate: 0.072,
         }
     }
 }
@@ -105,6 +110,8 @@ pub fn compute_signal(pm: &Quote, bn: &Quote, cfg: SignalConfig) -> Signal {
         oldest_quote_age_ms,
         cfg.alpha_half_life_ms,
         pm.price,
+        cfg.polymarket_fees_enabled,
+        cfg.polymarket_fee_rate,
         cfg.costs,
     );
 

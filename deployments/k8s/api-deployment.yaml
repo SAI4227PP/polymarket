@@ -22,6 +22,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: polymarket-config
+            - secretRef:
+                name: polymarket-secrets
 ---
 apiVersion: v1
 kind: Service
@@ -36,3 +38,4 @@ spec:
       port: 8080
       targetPort: 8080
   type: ClusterIP
+

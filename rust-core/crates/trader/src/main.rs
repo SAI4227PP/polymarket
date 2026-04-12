@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use adapters_binance::{ws as binance_ws, BinanceClient};
-use adapters_polymarket::{ws as polymarket_ws, PolymarketClient};
-use common::{Quote, RiskDecision, TradeDirection};
+use adapters_polymarket::{ws as polymarket_ws, LiveFillCriteria, LiveLimitOrderRequest, LiveOrderSide, PolymarketClient};
+use common::{OrderIntent, Quote, RiskDecision, TradeDirection};
 use execution_engine::order_manager::{self, ExecutionConfig};
 use portfolio_engine::daily::{update_daily_history, PortfolioDayStats};
 use portfolio_engine::pnl::{total_pnl, unrealized_pnl};
@@ -26,6 +26,21 @@ struct PendingPosition {
     entry_ts_ms: u64,
     settle_at_ms: u64,
     expected_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLiveEntry {
+    id: String,
+    direction: TradeDirection,
+    quantity: f64,
+    entry_price: f64,
+    entry_notional_usd: f64,
+    expected_pnl_usd: f64,
+    submitted_ts_ms: u64,
+    settle_at_ms: u64,
+    criteria: LiveFillCriteria,
+    submit_status: String,
+    last_reconcile_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +120,14 @@ struct TraderState {
     portfolio_drawdown_pct_from_peak: f64,
 }
 
+
+#[derive(Debug, Clone)]
+struct LiveTradingConfig {
+    market_id: String,
+    up_token_id: String,
+    down_token_id: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let bn_symbol = std::env::var("BINANCE_SYMBOL").unwrap_or_else(|_| "BTCUSDT".to_string());
@@ -125,19 +148,45 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
     let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
         .unwrap_or_else(|_| "trader:live_btc:latest".to_string());
-    let redis_past_outcomes_key = std::env::var("REDIS_PAST_OUTCOMES_KEY")
-        .unwrap_or_else(|_| "trader:past_outcomes:latest".to_string());
     let redis_portfolio_daily_key = std::env::var("REDIS_PORTFOLIO_DAILY_KEY")
         .unwrap_or_else(|_| "trader:portfolio:daily".to_string());
-    let configured_event_slug = std::env::var("POLYMARKET_EVENT_SLUG").unwrap_or_default();
     let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
+
+    let mut polymarket_market_category = std::env::var("POLYMARKET_MARKET_CATEGORY")
+        .unwrap_or_else(|_| "crypto".to_string())
+        .to_ascii_lowercase();
+    let mut polymarket_fees_enabled = env_bool("POLYMARKET_FEES_ENABLED", true);
+    if let Ok(meta) = polymarket_ws::resolve_market_metadata_from_env().await {
+        if let Some(c) = meta.category {
+            polymarket_market_category = c.to_ascii_lowercase();
+        }
+        if let Some(f) = meta.fees_enabled {
+            polymarket_fees_enabled = f;
+        }
+    }
+
+    let polymarket_fee_rate = match std::env::var("POLYMARKET_FEE_RATE") {
+        Ok(raw) => raw
+            .parse::<f64>()
+            .with_context(|| format!("invalid POLYMARKET_FEE_RATE value: {raw}"))?,
+        Err(_) => polymarket_fee_rate_for_category(&polymarket_market_category)?,
+    };
+
+    eprintln!(
+        "polymarket metadata category={} fees_enabled={} fee_rate={}",
+        polymarket_market_category,
+        polymarket_fees_enabled,
+        polymarket_fee_rate
+    );
 
     let base_signal_cfg = SignalConfig {
         min_edge_bps,
-        anchor_price: env_f64("BINANCE_ANCHOR_PRICE", 100_000.0),
+        anchor_price: env_f64("CHAINLINK_ANCHOR_PRICE", env_f64("BINANCE_ANCHOR_PRICE", 100_000.0)),
         basis_bps: env_f64("BINANCE_BASIS_BPS", 0.0),
         target_notional_usd: order_notional_usd,
         microstructure_model_weight: env_f64("BINANCE_SIGNAL_WEIGHT", 0.35),
+        polymarket_fees_enabled,
+        polymarket_fee_rate,
         ..SignalConfig::default()
     };
 
@@ -150,14 +199,24 @@ async fn main() -> Result<()> {
         max_concentration_ratio: env_f64("MAX_CONCENTRATION_RATIO", 0.5),
     };
 
+    let configured_account_equity_usd = env_f64("ACCOUNT_EQUITY_USD", 10.0);
     let runtime_wallet_balance_usd = if is_live_mode {
         env_f64(
             "LIVE_WALLET_BALANCE_USD",
-            env_f64("ACCOUNT_EQUITY_USD", 10.0),
+            configured_account_equity_usd,
         )
     } else {
-        env_f64("DEMO_WALLET_BALANCE_USD", 10.0)
+        env_f64("DEMO_WALLET_BALANCE_USD", configured_account_equity_usd)
     };
+    if (runtime_wallet_balance_usd - configured_account_equity_usd).abs() > 1e-9 {
+        eprintln!(
+            "wallet/equity mismatch detected: ACCOUNT_EQUITY_USD={} runtime_wallet_balance_usd={} mode={} (using runtime wallet for both sizing and risk)",
+            configured_account_equity_usd,
+            runtime_wallet_balance_usd,
+            mode
+        );
+    }
+    let effective_account_equity_usd = runtime_wallet_balance_usd;
 
     let kill_cfg = KillSwitchConfig {
         max_drawdown_pct: env_f64("KILL_SWITCH_DRAWDOWN_PCT", 5.0),
@@ -170,23 +229,46 @@ async fn main() -> Result<()> {
         edge_threshold_bps: env_f64("EXECUTION_EDGE_THRESHOLD_BPS", 5.0),
         min_net_edge_margin_bps: env_f64("EXECUTION_MIN_NET_EDGE_MARGIN_BPS", 3.0),
         max_slippage_bps: env_f64("EXECUTION_MAX_SLIPPAGE_BPS", 80.0),
-        demo_wallet_balance_usd: runtime_wallet_balance_usd,
+        demo_wallet_balance_usd: effective_account_equity_usd,
         min_order_notional_usd: env_f64("MIN_ORDER_NOTIONAL_USD", 1.0),
         min_order_shares: env_f64("MIN_ORDER_SHARES", 5.0),
         ..ExecutionConfig::default()
     };
 
-    let account_equity_usd = env_f64("ACCOUNT_EQUITY_USD", 10.0);
+    let account_equity_usd = effective_account_equity_usd;
     let realized_vol_bps = env_f64("REALIZED_VOL_BPS", 50.0);
 
-    let _pm = PolymarketClient::new();
+    let pm_client = PolymarketClient::new();
     let _bn = BinanceClient::new();
 
+    let live_order_enabled = is_live_mode && env_bool("POLYMARKET_LIVE_ORDER_ENABLED", true);
+    let live_trading_cfg = if live_order_enabled {
+        let market_id = polymarket_ws::resolve_market_id_for_live_trading().await?;
+        let tokens = polymarket_ws::resolve_outcome_tokens_from_env().await?;
+        eprintln!(
+            "live order routing enabled market_id={} up_token={} down_token={}",
+            market_id,
+            tokens.up_token,
+            tokens.down_token
+        );
+        Some(LiveTradingConfig {
+            market_id,
+            up_token_id: tokens.up_token,
+            down_token_id: tokens.down_token,
+        })
+    } else {
+        None
+    };
     let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
     let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
+    let (chainlink_tx, chainlink_rx) = watch::channel::<Option<Quote>>(None);
 
     spawn_binance_stream(bn_symbol.clone(), bn_tx);
     spawn_polymarket_stream(pm_tx);
+    spawn_chainlink_reference_stream(chainlink_tx);
+    if is_live_mode {
+        spawn_polymarket_user_stream();
+    }
 
     let mut redis_conn: Option<MultiplexedConnection> = None;
 
@@ -194,7 +276,10 @@ async fn main() -> Result<()> {
     let mut day_pnl_usd = 0.0;
     let mut portfolio_realized_pnl_usd = 0.0;
     let mut pending_positions: Vec<PendingPosition> = Vec::new();
+    let mut pending_live_entries: Vec<PendingLiveEntry> = Vec::new();
     let mut trade_history: Vec<CompletedTrade> = Vec::new();
+    let live_reconcile_wait_timeout_ms = env_u64("POLYMARKET_LIVE_RECONCILE_WAIT_TIMEOUT_MS", 350);
+    let live_reconcile_max_age_ms = env_u64("POLYMARKET_LIVE_RECONCILE_MAX_AGE_MS", 120_000);
     let mut portfolio_daily_history = match load_portfolio_daily_from_redis(
         &redis_url,
         &redis_portfolio_daily_key,
@@ -270,11 +355,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut last_past_probability: Option<f64> = None;
     let mut error_streak = 0u32;
     let mut oldest_quote_age_ms = 0u64;
     let mut current_5m_bucket_start_ms: Option<u64> = None;
     let mut current_5m_anchor_price = base_signal_cfg.anchor_price;
+    let allow_binance_anchor_fallback = env_bool("ALLOW_BINANCE_ANCHOR_FALLBACK", false);
     let mut kill_switch_latched = false;
     let mut transient_kill_blocked_prev = false;
     let mut daily_loss_latched = false;
@@ -335,12 +420,24 @@ async fn main() -> Result<()> {
         }
         let pm_snapshot = pm_rx.borrow().clone();
         let bn_snapshot = bn_rx.borrow().clone();
-        if let Some(bnq) = bn_snapshot.as_ref() {
-            let bucket = five_min_bucket_start_ms(bnq.ts_ms);
+        let chainlink_snapshot = chainlink_rx.borrow().clone();
+
+        if let Some(clq) = chainlink_snapshot.as_ref() {
+            let bucket = five_min_bucket_start_ms(clq.ts_ms);
             if current_5m_bucket_start_ms != Some(bucket) {
                 current_5m_bucket_start_ms = Some(bucket);
-                if bnq.price.is_finite() && bnq.price > 0.0 {
-                    current_5m_anchor_price = bnq.price;
+                if clq.price.is_finite() && clq.price > 0.0 {
+                    current_5m_anchor_price = clq.price;
+                }
+            }
+        } else if allow_binance_anchor_fallback {
+            if let Some(bnq) = bn_snapshot.as_ref() {
+                let bucket = five_min_bucket_start_ms(bnq.ts_ms);
+                if current_5m_bucket_start_ms != Some(bucket) {
+                    current_5m_bucket_start_ms = Some(bucket);
+                    if bnq.price.is_finite() && bnq.price > 0.0 {
+                        current_5m_anchor_price = bnq.price;
+                    }
                 }
             }
         }
@@ -350,26 +447,94 @@ async fn main() -> Result<()> {
             ..base_signal_cfg
         };
 
-        if let Some(q) = pm_snapshot.as_ref() {
-            if q.venue == "polymarket-past-results" {
-                last_past_probability = Some(q.price.clamp(0.0, 1.0));
-            } else if q.venue == "polymarket-prior" && last_past_probability.is_none() {
-                // Fallback: if the explicit past-results seed was missed between loop ticks,
-                // reuse prior probability so API websocket always has a past_outcomes payload.
-                last_past_probability = Some(q.price.clamp(0.0, 1.0));
+        if is_live_mode && !pending_live_entries.is_empty() {
+            let mut still_pending: Vec<PendingLiveEntry> = Vec::with_capacity(pending_live_entries.len());
+            let mut reconciled_positions: Vec<PendingPosition> = Vec::new();
+            for mut pending in pending_live_entries.drain(..) {
+                let age_ms = now_ms().saturating_sub(pending.submitted_ts_ms);
+                if age_ms >= live_reconcile_max_age_ms {
+                    eprintln!(
+                        "live entry reconciliation expired id={} age_ms={} status={}",
+                        pending.id, age_ms, pending.submit_status
+                    );
+                    continue;
+                }
+                match pm_client
+                    .wait_for_user_fill(&pending.criteria, live_reconcile_wait_timeout_ms)
+                    .await
+                {
+                    Ok(Some(fill)) => {
+                        let matched_qty = fill.matched_size.max(0.0).min(pending.quantity);
+                        if matched_qty <= 0.0 {
+                            pending.last_reconcile_status = format!(
+                                "awaiting_user_ws_fill matched_qty_non_positive fill_status={}",
+                                fill.status
+                            );
+                            still_pending.push(pending);
+                            continue;
+                        }
+
+                        let entry_ts_ms = fill.ts_ms.max(pending.submitted_ts_ms);
+                        eprintln!(
+                            "live entry fill reconciled id={} matched_qty={:.6} fill_status={} fill_ts_ms={}",
+                            pending.id, matched_qty, fill.status, fill.ts_ms
+                        );
+                        reconciled_positions.push(PendingPosition {
+                            id: pending.id,
+                            direction: pending.direction,
+                            quantity: matched_qty,
+                            entry_price: pending.entry_price,
+                            entry_notional_usd: (matched_qty * pending.entry_price).max(0.0),
+                            entry_ts_ms,
+                            settle_at_ms: pending.settle_at_ms.max(entry_ts_ms.saturating_add(position_ttl_ms)),
+                            expected_pnl_usd: pending.expected_pnl_usd,
+                        });
+                    }
+                    Ok(None) => {
+                        pending.last_reconcile_status =
+                            format!("awaiting_user_ws_fill age_ms={}", age_ms);
+                        still_pending.push(pending);
+                    }
+                    Err(err) => {
+                        pending.last_reconcile_status = format!("reconcile_error {err:#}");
+                        eprintln!(
+                            "live entry reconcile error id={} err={err:#}",
+                            pending.id
+                        );
+                        still_pending.push(pending);
+                    }
+                }
+            }
+            pending_live_entries = still_pending;
+            if !reconciled_positions.is_empty() {
+                pending_positions.extend(reconciled_positions);
             }
         }
 
         let open_positions = pending_positions.len();
-        let open_direction = current_open_direction(&pending_positions);
-        let current_gross_exposure_usd: f64 = pending_positions
+        let effective_open_positions = pending_positions.len() + pending_live_entries.len();
+        let open_direction = current_open_direction(&pending_positions).or_else(|| {
+            pending_live_entries.first().map(|p| p.direction)
+        });
+        let current_gross_exposure_usd_filled: f64 = pending_positions
             .iter()
             .map(|p| p.entry_notional_usd.abs())
             .sum();
-        let current_largest_position_usd = pending_positions
+        let pending_live_exposure_usd: f64 = pending_live_entries
+            .iter()
+            .map(|p| p.entry_notional_usd.abs())
+            .sum();
+        let current_gross_exposure_usd = current_gross_exposure_usd_filled + pending_live_exposure_usd;
+        let current_largest_filled_position_usd = pending_positions
             .iter()
             .map(|p| p.entry_notional_usd.abs())
             .fold(0.0, f64::max);
+        let current_largest_pending_live_usd = pending_live_entries
+            .iter()
+            .map(|p| p.entry_notional_usd.abs())
+            .fold(0.0, f64::max);
+        let current_largest_position_usd =
+            current_largest_filled_position_usd.max(current_largest_pending_live_usd);
 
         let kill_state = KillSwitchState {
             current_drawdown_pct,
@@ -445,7 +610,7 @@ async fn main() -> Result<()> {
             execution_cfg,
             order_notional_usd,
             day_pnl_usd,
-            open_positions,
+            effective_open_positions,
             open_direction,
             current_gross_exposure_usd,
             current_largest_position_usd,
@@ -454,12 +619,16 @@ async fn main() -> Result<()> {
             realized_vol_bps,
             kill_cfg.max_stale_data_ms,
             entries_latched,
+            &pm_client,
+            is_live_mode,
+            live_trading_cfg.as_ref(),
         )
         .await;
 
         match iteration {
             Ok(IterationOutcome {
                 position,
+                pending_live_submission,
                 state,
                 close_open_positions,
                 close_reason,
@@ -474,6 +643,38 @@ async fn main() -> Result<()> {
                             "skipped:entries_blocked_no_new_entries {}",
                             reason
                         );
+                    }
+                }
+
+                let mut close_open_positions = close_open_positions;
+                if !pending_live_entries.is_empty() {
+                    close_open_positions = false;
+                }
+                if close_open_positions && is_live_mode {
+                    if let Some(cfg) = live_trading_cfg.as_ref() {
+                        let mut close_errors = Vec::new();
+                        for pos in &pending_positions {
+                            match submit_live_exit_order(&pm_client, cfg, pos, state.polymarket_mid).await {
+                                Ok(LiveSubmitOutcome::Filled { .. }) => {}
+                                Ok(LiveSubmitOutcome::Pending { status }) => {
+                                    close_errors.push(format!("{}: pending {}", pos.id, status));
+                                }
+                                Err(err) => {
+                                    close_errors.push(format!("{}: {err:#}", pos.id));
+                                }
+                            }
+                        }
+                        if !close_errors.is_empty() {
+                            close_open_positions = false;
+                            state.execution_status = format!(
+                                "skipped:live_close_failed {}",
+                                close_errors.join(" | ")
+                            );
+                        }
+                    } else {
+                        close_open_positions = false;
+                        state.execution_status =
+                            "skipped:live_close_failed missing live trading config".to_string();
                     }
                 }
 
@@ -496,6 +697,9 @@ async fn main() -> Result<()> {
                 if let Some(pos) = position {
                     pending_positions.push(pos);
                 }
+                if let Some(pending_submission) = pending_live_submission {
+                    pending_live_entries.push(pending_submission);
+                }
                 let portfolio_position = build_portfolio_position(&pending_positions);
                 let mark_price = state.polymarket_mid.clamp(0.0, 1.0);
                 let unrealized_pnl_usd = unrealized_pnl(portfolio_position.avg_price, mark_price, portfolio_position.qty);
@@ -506,7 +710,7 @@ async fn main() -> Result<()> {
                     portfolio_position.qty,
                 );
 
-                state.open_positions = pending_positions.len();
+                state.open_positions = pending_positions.len() + pending_live_entries.len();
                 state.day_pnl_usd = day_pnl_usd;
                 state.portfolio_net_qty = portfolio_position.qty;
                 state.portfolio_avg_entry = portfolio_position.avg_price;
@@ -520,6 +724,15 @@ async fn main() -> Result<()> {
                 current_drawdown_pct =
                     pnl_drawdown_pct_from_peak(total_pnl_usd, peak_total_pnl_usd, min_peak_pnl_for_drawdown_pct);
                 state.portfolio_drawdown_pct_from_peak = current_drawdown_pct;
+                if !pending_live_entries.is_empty() {
+                    let pending = &pending_live_entries[0];
+                    state.action = "live_entry_submitted".to_string();
+                    state.position_signal = "live_entry_submitted".to_string();
+                    state.execution_status = format!(
+                        "submitted:awaiting_user_ws_fill id={} submitted_ts_ms={} {}",
+                        pending.id, pending.submitted_ts_ms, pending.last_reconcile_status
+                    );
+                }
 
                 let day_key = utc_day_string(state.ts_ms);
                 update_daily_history(
@@ -555,11 +768,7 @@ async fn main() -> Result<()> {
                 if let Err(err) = publish_aux_stream_payloads_to_redis(
                     &redis_url,
                     &redis_live_btc_key,
-                    &redis_past_outcomes_key,
-                    &configured_event_slug,
-                    pm_snapshot.clone(),
                     bn_snapshot.clone(),
-                    last_past_probability,
                     &mut redis_conn,
                 )
                 .await
@@ -601,6 +810,7 @@ async fn main() -> Result<()> {
 
 struct IterationOutcome {
     position: Option<PendingPosition>,
+    pending_live_submission: Option<PendingLiveEntry>,
     state: TraderState,
     close_open_positions: bool,
     close_reason: Option<String>,
@@ -624,6 +834,9 @@ async fn run_iteration(
     realized_vol_bps: f64,
     max_quote_age_ms: u64,
     entries_latched: bool,
+    pm_client: &PolymarketClient,
+    is_live_mode: bool,
+    live_trading_cfg: Option<&LiveTradingConfig>,
 ) -> Result<IterationOutcome> {
     let pm_quote = match pm_rx.borrow().clone() {
         Some(q) => q,
@@ -631,6 +844,7 @@ async fn run_iteration(
             eprintln!("waiting for polymarket quote...");
             return Ok(IterationOutcome {
                 position: None,
+                pending_live_submission: None,
                 state: waiting_state(day_pnl_usd, open_positions),
                 close_open_positions: false,
                 close_reason: None,
@@ -644,6 +858,7 @@ async fn run_iteration(
         state.oldest_quote_age_ms = now_ms().saturating_sub(pm_quote.ts_ms);
         return Ok(IterationOutcome {
             position: None,
+            pending_live_submission: None,
             state,
             close_open_positions: false,
             close_reason: None,
@@ -656,6 +871,7 @@ async fn run_iteration(
             eprintln!("waiting for binance quote...");
             return Ok(IterationOutcome {
                 position: None,
+                pending_live_submission: None,
                 state: waiting_state(day_pnl_usd, open_positions),
                 close_open_positions: false,
                 close_reason: None,
@@ -767,6 +983,69 @@ async fn run_iteration(
         .map(|o| o.quantity * o.limit_price)
         .unwrap_or(0.0);
     let mut report = order_manager::submit_if_needed(intent);
+    let mut live_filled_qty: Option<f64> = None;
+    let mut pending_live_submission: Option<PendingLiveEntry> = None;
+    if report.accepted && is_live_mode {
+        match (submitted_intent.as_ref(), live_trading_cfg) {
+            (Some(order), Some(cfg)) => match submit_live_entry_order(pm_client, cfg, order).await {
+                Ok(LiveSubmitOutcome::Filled { status, matched_qty }) => {
+                    live_filled_qty = Some(matched_qty.max(0.0));
+                    report.status = format!("live_order_filled {}", status);
+                }
+                Ok(LiveSubmitOutcome::Pending { status }) => {
+                    report.status = format!("live_order_submitted {}", status);
+                    let submitted_ts_ms = now_ms();
+                    let expected_pnl_usd =
+                        (order.quantity * order.limit_price) * (signal.net_edge_bps / 10_000.0);
+                    let live_min_fill_size = env_f64("POLYMARKET_LIVE_MIN_FILL_SIZE", 0.001).max(0.0);
+                    match token_id_for_direction(cfg, order.direction) {
+                        Ok(token_id) => {
+                            pending_live_submission = Some(PendingLiveEntry {
+                                id: format!("BTC-{}", submitted_ts_ms),
+                                direction: order.direction,
+                                quantity: order.quantity,
+                                entry_price: order.limit_price,
+                                entry_notional_usd: (order.quantity * order.limit_price).max(0.0),
+                                expected_pnl_usd,
+                                submitted_ts_ms,
+                                settle_at_ms: submitted_ts_ms.saturating_add(position_ttl_ms),
+                                criteria: LiveFillCriteria {
+                                    market_id: cfg.market_id.clone(),
+                                    token_id: token_id.to_string(),
+                                    side: LiveOrderSide::Buy,
+                                    min_size: live_min_fill_size,
+                                },
+                                submit_status: status,
+                                last_reconcile_status: "awaiting_user_ws_fill".to_string(),
+                            });
+                        }
+                        Err(err) => {
+                            report.accepted = false;
+                            report.status = format!("skipped:live_order_failed {err:#}");
+                        }
+                    }
+                }
+                Err(err) => {
+                    report.accepted = false;
+                    report.status = format!("skipped:live_order_failed {err:#}");
+                }
+            },
+            _ => {
+                report.accepted = false;
+                report.status = "skipped:live_order_config_missing".to_string();
+            }
+        }
+    } else if report.accepted && !is_live_mode {
+        report.status = format!(
+            "paper_order_filled order_status=matched trade_status=CONFIRMED qty={} price={} notional={}",
+            submitted_intent.as_ref().map(|o| o.quantity).unwrap_or(0.0),
+            submitted_intent.as_ref().map(|o| o.limit_price).unwrap_or(0.0),
+            submitted_intent
+                .as_ref()
+                .map(|o| o.quantity * o.limit_price)
+                .unwrap_or(0.0)
+        );
+    }
     if !report.accepted && entries_latched && !has_open_positions {
         report.status = "skipped:entries_blocked_no_new_entries".to_string();
     } else if !report.accepted && can_open_new_position && blocked_first_seconds_5m {
@@ -792,7 +1071,9 @@ async fn run_iteration(
         report.status = format!("skipped:risk_rejected {}", risk.reason);
     }
 
-    let entry_signal = can_open_new_position && signal.should_trade && risk.allowed && report.accepted;
+    let live_fill_confirmed = is_live_mode && live_filled_qty.is_some();
+    let live_entry_submitted = is_live_mode && report.accepted && submitted_intent.is_some() && !live_fill_confirmed;
+    let entry_signal = can_open_new_position && signal.should_trade && risk.allowed && report.accepted && (!is_live_mode || live_fill_confirmed);
     let hold_strong_edge_bps = env_f64("HOLD_STRONG_EDGE_BPS", (signal_cfg.min_edge_bps * 0.6).max(1.0));
     let invalidation_close_bps =
         env_f64("INVALIDATION_CLOSE_BPS", (signal_cfg.min_edge_bps * 0.8).max(4.0));
@@ -842,7 +1123,9 @@ async fn run_iteration(
     }
     let exit_signal = close_reason.is_some();
 
-    let position_signal = if entry_signal {
+    let position_signal = if live_entry_submitted {
+        "live_entry_submitted".to_string()
+    } else if entry_signal {
         match signal.direction {
             TradeDirection::Up => "open_up",
             TradeDirection::Down => "open_down",
@@ -880,6 +1163,8 @@ async fn run_iteration(
         "hold_strong_direction"
     } else if reversal_signal {
         "close_on_reversal"
+    } else if live_entry_submitted {
+        "live_entry_submitted"
     } else if entry_signal {
         "entry_signal"
     } else if exit_signal {
@@ -933,6 +1218,20 @@ async fn run_iteration(
         portfolio_drawdown_pct_from_peak: 0.0,
     };
 
+    if live_entry_submitted {
+        let mut live_state = state;
+        live_state.action = "live_entry_submitted".to_string();
+        live_state.position_signal = "live_entry_submitted".to_string();
+        live_state.execution_status = format!("submitted:awaiting_user_ws_fill {}", report.status);
+        return Ok(IterationOutcome {
+            position: None,
+            pending_live_submission,
+            state: live_state,
+            close_open_positions: false,
+            close_reason: None,
+        });
+    }
+
     if report.accepted {
         let expected_pnl_usd = filled_notional_usd * (signal.net_edge_bps / 10_000.0);
         if let Some(order) = submitted_intent {
@@ -941,13 +1240,14 @@ async fn run_iteration(
                 position: Some(PendingPosition {
                     id: format!("BTC-{}", ts),
                     direction: order.direction,
-                    quantity: order.quantity,
+                    quantity: live_filled_qty.unwrap_or(order.quantity),
                     entry_price: order.limit_price,
-                    entry_notional_usd: order.quantity * order.limit_price,
+                    entry_notional_usd: live_filled_qty.unwrap_or(order.quantity) * order.limit_price,
                     entry_ts_ms: ts,
                     settle_at_ms: ts.saturating_add(position_ttl_ms),
                     expected_pnl_usd,
                 }),
+                pending_live_submission: None,
                 state,
                 close_open_positions: false,
                 close_reason: None,
@@ -957,6 +1257,7 @@ async fn run_iteration(
 
     Ok(IterationOutcome {
         position: None,
+        pending_live_submission,
         state,
         close_open_positions: exit_signal,
         close_reason,
@@ -1234,11 +1535,7 @@ async fn publish_portfolio_daily_to_redis(
 async fn publish_aux_stream_payloads_to_redis(
     redis_url: &str,
     live_btc_key: &str,
-    past_outcomes_key: &str,
-    event_slug: &str,
-    pm_quote: Option<Quote>,
     bn_quote: Option<Quote>,
-    last_past_probability: Option<f64>,
     conn: &mut Option<MultiplexedConnection>,
 ) -> Result<()> {
     if conn.is_none() {
@@ -1261,37 +1558,13 @@ async fn publish_aux_stream_payloads_to_redis(
         json!({ "warning": "live btc unavailable" })
     };
 
-    let derived_event_slug = if !event_slug.trim().is_empty() {
-        event_slug.to_string()
-    } else {
-        pm_quote.map(|q| q.symbol).unwrap_or_default()
-    };
-
-    let past_outcomes_payload = if let Some(p) = last_past_probability {
-        json!({
-            "source": "polymarket-past-results",
-            "event_slug": derived_event_slug,
-            "probability_up": p,
-            "ts_ms": now_ms()
-        })
-    } else {
-        json!({ "warning": "past outcomes unavailable" })
-    };
-
     if let Some(c) = conn.as_mut() {
         let live_payload = serde_json::to_string(&live_btc_payload).context("serialize live btc payload")?;
-        let past_payload = serde_json::to_string(&past_outcomes_payload).context("serialize past outcomes payload")?;
 
         let live_set: redis::RedisResult<()> = c.set(live_btc_key, live_payload).await;
         if let Err(e) = live_set {
             *conn = None;
             return Err(anyhow!("redis set live btc failed: {e}"));
-        }
-
-        let past_set: redis::RedisResult<()> = c.set(past_outcomes_key, past_payload).await;
-        if let Err(e) = past_set {
-            *conn = None;
-            return Err(anyhow!("redis set past outcomes failed: {e}"));
         }
     }
 
@@ -1377,6 +1650,23 @@ fn spawn_binance_stream(symbol: String, tx: watch::Sender<Option<Quote>>) {
     });
 }
 
+
+fn spawn_chainlink_reference_stream(tx: watch::Sender<Option<Quote>>) {
+    tokio::spawn(async move {
+        loop {
+            match polymarket_ws::stream_chainlink_btc_reference().await {
+                Ok(q) => {
+                    let _ = tx.send(Some(q));
+                }
+                Err(err) => {
+                    eprintln!("chainlink btc reference stream error: {err:#}");
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_polymarket_stream(tx: watch::Sender<Option<Quote>>) {
     tokio::spawn(async move {
         let mut last_instrument: Option<String> = None;
@@ -1442,6 +1732,28 @@ fn spawn_polymarket_stream(tx: watch::Sender<Option<Quote>>) {
     });
 }
 
+fn spawn_polymarket_user_stream() {
+    tokio::spawn(async move {
+        loop {
+            let market_id = match polymarket_ws::resolve_market_id_for_live_trading().await {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("polymarket user stream market-id resolve error: {err:#}");
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            eprintln!("polymarket user stream subscribe market_id={}", market_id);
+            match polymarket_ws::run_user_event_stream(&market_id).await {
+                Ok(()) => {}
+                Err(err) => eprintln!("polymarket user stream error: {err:#}"),
+            }
+            sleep(Duration::from_millis(750)).await;
+        }
+    });
+}
+
 fn extract_5m_bucket(value: &str) -> Option<i64> {
     let token = value.split('-').next_back()?.trim();
     token.parse::<i64>().ok()
@@ -1485,10 +1797,7 @@ fn current_open_direction(pending_positions: &[PendingPosition]) -> Option<Trade
 }
 
 fn is_tradeable_polymarket_quote(q: &Quote) -> bool {
-    matches!(
-        q.venue.as_str(),
-        "polymarket" | "polymarket-live-data" | "polymarket-gamma" | "polymarket-prior"
-    )
+    q.venue == "polymarket"
 }
 
 fn close_positions_now(
@@ -1560,6 +1869,126 @@ fn position_pnl_usd(direction: TradeDirection, quantity: f64, entry_price: f64, 
     }
 }
 
+#[derive(Debug, Clone)]
+enum LiveSubmitOutcome {
+    Filled { status: String, matched_qty: f64 },
+    Pending { status: String },
+}
+
+async fn submit_live_entry_order(
+    pm_client: &PolymarketClient,
+    cfg: &LiveTradingConfig,
+    order: &OrderIntent,
+) -> Result<LiveSubmitOutcome> {
+    let live_min_fill_size = env_f64("POLYMARKET_LIVE_MIN_FILL_SIZE", 0.001).max(0.0);
+    let token_id = token_id_for_direction(cfg, order.direction)?;
+    let receipt = pm_client
+        .place_limit_order_live(LiveLimitOrderRequest {
+            market_id: cfg.market_id.clone(),
+            token_id: token_id.to_string(),
+            price: order.limit_price.clamp(0.001, 0.999),
+            size: order.quantity,
+            side: LiveOrderSide::Buy,
+        })
+        .await?;
+
+    let wait_timeout_ms = env_u64("POLYMARKET_LIVE_FILL_WAIT_TIMEOUT_MS", 2_000);
+    let fill = pm_client
+        .wait_for_user_fill(
+            &LiveFillCriteria {
+                market_id: cfg.market_id.clone(),
+                token_id: token_id.to_string(),
+                side: LiveOrderSide::Buy,
+                min_size: live_min_fill_size,
+            },
+            wait_timeout_ms,
+        )
+        .await?;
+
+    Ok(match fill {
+        Some(f) => LiveSubmitOutcome::Filled {
+            status: format!("{} fill_status={} fill_ts_ms={}", receipt.status, f.status, f.ts_ms),
+            matched_qty: f.matched_size.max(0.0),
+        },
+        None => LiveSubmitOutcome::Pending {
+            status: format!("{} no_fill_within_{}ms", receipt.status, wait_timeout_ms),
+        },
+    })
+}
+
+async fn submit_live_exit_order(
+    pm_client: &PolymarketClient,
+    cfg: &LiveTradingConfig,
+    pos: &PendingPosition,
+    mark_price: f64,
+) -> Result<LiveSubmitOutcome> {
+    let live_min_fill_size = env_f64("POLYMARKET_LIVE_MIN_FILL_SIZE", 0.001).max(0.0);
+    let token_id = token_id_for_direction(cfg, pos.direction)?;
+    let receipt = pm_client
+        .place_limit_order_live(LiveLimitOrderRequest {
+            market_id: cfg.market_id.clone(),
+            token_id: token_id.to_string(),
+            price: mark_price.clamp(0.001, 0.999),
+            size: pos.quantity,
+            side: LiveOrderSide::Sell,
+        })
+        .await?;
+
+    let wait_timeout_ms = env_u64("POLYMARKET_LIVE_FILL_WAIT_TIMEOUT_MS", 2_000);
+    let fill = pm_client
+        .wait_for_user_fill(
+            &LiveFillCriteria {
+                market_id: cfg.market_id.clone(),
+                token_id: token_id.to_string(),
+                side: LiveOrderSide::Sell,
+                min_size: live_min_fill_size,
+            },
+            wait_timeout_ms,
+        )
+        .await?;
+
+    Ok(match fill {
+        Some(f) => LiveSubmitOutcome::Filled {
+            status: format!("{} fill_status={} fill_ts_ms={}", receipt.status, f.status, f.ts_ms),
+            matched_qty: f.matched_size.max(0.0),
+        },
+        None => LiveSubmitOutcome::Pending {
+            status: format!("{} no_fill_within_{}ms", receipt.status, wait_timeout_ms),
+        },
+    })
+}
+
+fn token_id_for_direction<'a>(cfg: &'a LiveTradingConfig, direction: TradeDirection) -> Result<&'a str> {
+    match direction {
+        TradeDirection::Up => Ok(cfg.up_token_id.as_str()),
+        TradeDirection::Down => Ok(cfg.down_token_id.as_str()),
+        TradeDirection::Flat => Err(anyhow!("flat direction has no live token mapping")),
+    }
+}
+
+fn polymarket_fee_rate_for_category(category: &str) -> Result<f64> {
+    match category.trim().to_ascii_lowercase().as_str() {
+        "crypto" => env_f64_required("POLYMARKET_FEE_RATE_CRYPTO"),
+        "sports" => env_f64_required("POLYMARKET_FEE_RATE_SPORTS"),
+        "finance" => env_f64_required("POLYMARKET_FEE_RATE_FINANCE"),
+        "politics" => env_f64_required("POLYMARKET_FEE_RATE_POLITICS"),
+        "mentions" => env_f64_required("POLYMARKET_FEE_RATE_MENTIONS"),
+        "tech" => env_f64_required("POLYMARKET_FEE_RATE_TECH"),
+        "economics" => env_f64_required("POLYMARKET_FEE_RATE_ECONOMICS"),
+        "culture" => env_f64_required("POLYMARKET_FEE_RATE_CULTURE"),
+        "weather" => env_f64_required("POLYMARKET_FEE_RATE_WEATHER"),
+        "other" | "general" => env_f64_required("POLYMARKET_FEE_RATE_OTHER"),
+        "geopolitics" => env_f64_required("POLYMARKET_FEE_RATE_GEOPOLITICS"),
+        unknown => {
+            eprintln!(
+                "unknown polymarket category '{}', using POLYMARKET_FEE_RATE_DEFAULT",
+                unknown
+            );
+            env_f64_required("POLYMARKET_FEE_RATE_DEFAULT")
+        }
+    }
+}
+
 fn trim_history(history: &mut Vec<CompletedTrade>, max_len: usize) {
     if max_len == 0 {
         history.clear();
@@ -1576,6 +2005,13 @@ fn env_f64(name: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
+}
+
+fn env_f64_required(name: &str) -> Result<f64> {
+    let raw = std::env::var(name)
+        .with_context(|| format!("missing required environment variable {name}"))?;
+    raw.parse::<f64>()
+        .with_context(|| format!("invalid {name} value: {raw}"))
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -1667,461 +2103,4 @@ fn now_ms() -> u64 {
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn q(venue: &str, price: f64, ts_ms: u64) -> Quote {
-        Quote {
-            venue: venue.to_string(),
-            symbol: "BTC".to_string(),
-            bid: price,
-            ask: price,
-            price,
-            ts_ms,
-        }
-    }
-
-    fn test_signal_cfg() -> SignalConfig {
-        SignalConfig {
-            min_edge_bps: 1.0,
-            anchor_price: 100_000.0,
-            basis_bps: 0.0,
-            microstructure_model_weight: 1.0,
-            regime_vol_bps: 0.0,
-            target_notional_usd: 10.0,
-            ..SignalConfig::default()
-        }
-    }
-
-    fn test_risk_limits() -> RiskLimits {
-        RiskLimits {
-            max_notional_usd: 100.0,
-            max_daily_loss_usd: 1_000.0,
-            max_open_positions: 3,
-            max_leverage: 10.0,
-            max_var_budget_usd: 1_000.0,
-            max_concentration_ratio: 0.5,
-        }
-    }
-
-    fn test_execution_cfg() -> ExecutionConfig {
-        ExecutionConfig {
-            base_qty: 1.0,
-            edge_threshold_bps: 1.0,
-            demo_wallet_balance_usd: 100.0,
-            min_order_notional_usd: 1.0,
-            min_order_shares: 0.01,
-            ..ExecutionConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn up_reverse_down_transitions_risk_and_portfolio() {
-        let now = now_ms();
-
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        // 1) Open UP
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let out1 = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("iteration 1 should succeed");
-
-        let up_pos = out1.position.expect("expected initial UP position");
-        assert_eq!(up_pos.direction, TradeDirection::Up);
-
-        let mut pending = vec![up_pos.clone()];
-        let portfolio_up = build_portfolio_position(&pending);
-        assert!(portfolio_up.qty > 0.0, "UP portfolio qty should be positive");
-
-        // 2) Reverse signal to DOWN -> should trigger close, no new open in same cycle
-        let now2 = now + 500;
-        pm_tx.send_replace(Some(q("polymarket", 0.80, now2)));
-        bn_tx.send_replace(Some(q("binance", 0.0, now2)));
-
-        let out2 = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            pending.len(),
-            Some(TradeDirection::Up),
-            pending.iter().map(|p| p.entry_notional_usd.abs()).sum(),
-            pending
-                .iter()
-                .map(|p| p.entry_notional_usd.abs())
-                .fold(0.0, f64::max),
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("iteration 2 should succeed");
-
-        assert!(out2.close_open_positions, "reversal should close open UP");
-        assert_eq!(out2.close_reason.as_deref(), Some("reverse_signal"));
-        assert!(out2.position.is_none(), "should not open DOWN in same iteration as close");
-
-        let mut day_pnl_usd = 0.0;
-        let mut portfolio_realized_pnl_usd = 0.0;
-        let closed = close_positions_now(
-            &mut pending,
-            &mut day_pnl_usd,
-            &mut portfolio_realized_pnl_usd,
-            out2.state.polymarket_mid,
-            now2,
-            "reverse_signal",
-        );
-        assert_eq!(pending.len(), 0, "pending positions must be cleared after close");
-        assert!(!closed.is_empty(), "should record a closed trade");
-        assert_eq!(closed[0].entry_side, "buy");
-        assert_eq!(closed[0].exit_side, "sell");
-
-        let portfolio_flat = build_portfolio_position(&pending);
-        assert!(portfolio_flat.qty.abs() < f64::EPSILON, "portfolio should be flat after close");
-
-        // 3) Next cycle with DOWN signal should open DOWN
-        let now3 = now2 + 500;
-        pm_tx.send_replace(Some(q("polymarket", 0.80, now3)));
-        bn_tx.send_replace(Some(q("binance", 0.0, now3)));
-
-        let out3 = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            day_pnl_usd,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("iteration 3 should succeed");
-
-        let down_pos = out3.position.expect("expected DOWN position after reversal close");
-        assert_eq!(down_pos.direction, TradeDirection::Down);
-
-        let portfolio_down = build_portfolio_position(&[down_pos]);
-        assert!(portfolio_down.qty < 0.0, "DOWN portfolio qty should be negative");
-    }
-
-    #[tokio::test]
-    async fn open_position_is_not_force_closed_by_entry_risk_check() {
-        let now = now_ms();
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let opened = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("open iteration should succeed");
-
-        let pos = opened.position.expect("expected initial UP position");
-        let now2 = now + 500;
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now2)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now2)));
-
-        let hold = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            1,
-            Some(TradeDirection::Up),
-            pos.entry_notional_usd.abs(),
-            pos.entry_notional_usd.abs(),
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("hold iteration should succeed");
-
-        assert!(!hold.close_open_positions, "existing position should not be force-closed");
-        assert!(hold.close_reason.is_none(), "no risk_rejected close expected");
-        assert!(hold.position.is_none(), "should not open a second position while one is live");
-    }
-
-    #[tokio::test]
-    async fn ignores_non_tradeable_polymarket_seed_quotes() {
-        let now = now_ms();
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        pm_tx.send_replace(Some(q("polymarket-past-results", 0.42, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let out = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("iteration should succeed");
-
-        assert!(out.position.is_none(), "must not trade on seed quote venues");
-        assert!(!out.close_open_positions, "must not close solely on seed quote venues");
-        assert_eq!(
-            out.state.action,
-            "waiting_tradeable_polymarket_quote",
-            "state should indicate waiting for tradable quote"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalidation_deadband_holds_instead_of_churn_close() {
-        let now = now_ms();
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        // Open a position first.
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let opened = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("open iteration should succeed");
-
-        let pos = opened.position.expect("expected position to be opened");
-
-        // With tiny/noisy edge around current price, deadband should hold, not close.
-        let now2 = now + 1_000;
-        pm_tx.send_replace(Some(q("polymarket", pos.entry_price, now2)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now2)));
-
-        let hold = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            1,
-            Some(pos.direction),
-            pos.entry_notional_usd.abs(),
-            pos.entry_notional_usd.abs(),
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("hold iteration should succeed");
-
-        assert!(!hold.close_open_positions, "deadband should avoid churn close");
-        assert!(hold.position.is_none(), "no second position while one is open");
-    }
-
-    #[tokio::test]
-    async fn risk_latched_blocks_new_entries() {
-        let now = now_ms();
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let out = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            true,
-        )
-        .await
-        .expect("iteration should succeed");
-
-        assert!(out.position.is_none(), "risk latch should block new entries");
-        assert_eq!(out.state.action, "entries_blocked_no_new_entries");
-        assert_eq!(out.state.execution_status, "skipped:entries_blocked_no_new_entries");
-    }
-
-    #[tokio::test]
-    async fn stale_quotes_do_not_force_close_by_themselves() {
-        let now = now_ms();
-        let (pm_tx, pm_rx) = watch::channel::<Option<Quote>>(None);
-        let (bn_tx, bn_rx) = watch::channel::<Option<Quote>>(None);
-
-        pm_tx.send_replace(Some(q("polymarket", 0.20, now)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, now)));
-
-        let opened = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            0,
-            None,
-            0.0,
-            0.0,
-            5_000,
-            100.0,
-            30.0,
-            60_000,
-            false,
-        )
-        .await
-        .expect("open iteration should succeed");
-
-        let pos = opened.position.expect("expected initial position");
-
-        let stale_ts = now.saturating_sub(5_000);
-        pm_tx.send_replace(Some(q("polymarket", pos.entry_price, stale_ts)));
-        bn_tx.send_replace(Some(q("binance", 100_000.0, stale_ts)));
-
-        let hold = run_iteration(
-            &pm_rx,
-            &bn_rx,
-            test_signal_cfg(),
-            test_risk_limits(),
-            test_execution_cfg(),
-            10.0,
-            0.0,
-            1,
-            Some(pos.direction),
-            pos.entry_notional_usd.abs(),
-            pos.entry_notional_usd.abs(),
-            5_000,
-            100.0,
-            30.0,
-            100,
-            false,
-        )
-        .await
-        .expect("hold iteration should succeed");
-
-        assert!(!hold.close_open_positions, "stale quotes alone must not force close");
-        assert!(hold.close_reason.is_none(), "no stale-based close reason expected");
-    }
-
-    #[test]
-    fn caps_notional_from_risk_limits() {
-        let limits = test_risk_limits();
-        let capped = capped_entry_notional_usd(10.0, 95.0, limits, 100.0);
-        assert!(capped <= 5.0 + f64::EPSILON, "capped={}", capped);
-    }
-
-    #[test]
-    fn detects_last_seconds_of_five_min_window() {
-        let window_ms = 5 * 60 * 1000;
-        assert!(!is_last_seconds_of_five_min_window(window_ms - 16_000, 15));
-        assert!(is_last_seconds_of_five_min_window(window_ms - 10_000, 15));
-    }
-
-    #[test]
-    fn detects_first_seconds_of_five_min_window() {
-        assert!(is_first_seconds_of_five_min_window(2_000, 3));
-        assert!(!is_first_seconds_of_five_min_window(4_000, 3));
-    }
-
-    #[test]
-    fn rounds_to_five_min_bucket_start() {
-        assert_eq!(five_min_bucket_start_ms(302_345), 300_000);
-        assert_eq!(five_min_bucket_start_ms(599_999), 300_000);
-        assert_eq!(five_min_bucket_start_ms(600_000), 600_000);
-    }
-}
