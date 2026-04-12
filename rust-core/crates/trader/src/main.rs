@@ -148,9 +148,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "trader:trades:latest".to_string());
     let redis_live_btc_key = std::env::var("REDIS_LIVE_BTC_KEY")
         .unwrap_or_else(|_| "trader:live_btc:latest".to_string());
+    let redis_past_outcomes_key = std::env::var("REDIS_PAST_OUTCOMES_KEY")
+        .unwrap_or_else(|_| "trader:past_outcomes:latest".to_string());
     let redis_portfolio_daily_key = std::env::var("REDIS_PORTFOLIO_DAILY_KEY")
         .unwrap_or_else(|_| "trader:portfolio:daily".to_string());
     let trade_history_limit = env_u64("TRADE_HISTORY_LIMIT", 200) as usize;
+    let past_outcomes_refresh_ms = env_u64("PAST_OUTCOMES_REFRESH_MS", 15_000).max(1_000);
 
     let mut polymarket_market_category = std::env::var("POLYMARKET_MARKET_CATEGORY")
         .unwrap_or_else(|_| "crypto".to_string())
@@ -359,6 +362,7 @@ async fn main() -> Result<()> {
     let mut oldest_quote_age_ms = 0u64;
     let mut current_5m_bucket_start_ms: Option<u64> = None;
     let mut current_5m_anchor_price = base_signal_cfg.anchor_price;
+    let mut last_past_outcomes_refresh_ms = 0u64;
     let allow_binance_anchor_fallback = env_bool("ALLOW_BINANCE_ANCHOR_FALLBACK", false);
     let mut kill_switch_latched = false;
     let mut transient_kill_blocked_prev = false;
@@ -395,6 +399,27 @@ async fn main() -> Result<()> {
     .await
     {
         eprintln!("redis trade-history initial publish error: {err:#}");
+    }
+
+    let mut initial_past_outcomes_payload = derive_past_outcomes_payload_from_history(&trade_history, None);
+    match polymarket_ws::fetch_market_outcome_payload_from_env().await {
+        Ok(official_payload) => {
+            initial_past_outcomes_payload = official_payload;
+        }
+        Err(err) => {
+            initial_past_outcomes_payload =
+                derive_past_outcomes_payload_from_history(&trade_history, Some(err.to_string()));
+        }
+    }
+    if let Err(err) = publish_past_outcomes_to_redis(
+        &redis_url,
+        &redis_past_outcomes_key,
+        &initial_past_outcomes_payload,
+        &mut redis_conn,
+    )
+    .await
+    {
+        eprintln!("redis past-outcomes initial publish error: {err:#}");
     }
 
 
@@ -555,6 +580,13 @@ async fn main() -> Result<()> {
                 );
             }
             kill_switch_latched = true;
+        } else if kill_switch_latched {
+            eprintln!(
+                "kill switch drawdown latch cleared drawdown_pct={:.2} threshold_pct={:.2}",
+                current_drawdown_pct,
+                kill_cfg.max_drawdown_pct
+            );
+            kill_switch_latched = false;
         }
 
         if transient_kill_blocked && !transient_kill_blocked_prev {
@@ -768,6 +800,7 @@ async fn main() -> Result<()> {
                 if let Err(err) = publish_aux_stream_payloads_to_redis(
                     &redis_url,
                     &redis_live_btc_key,
+                    chainlink_snapshot.clone(),
                     bn_snapshot.clone(),
                     &mut redis_conn,
                 )
@@ -804,6 +837,27 @@ async fn main() -> Result<()> {
         .await
         {
             eprintln!("redis trade-history publish error: {err:#}");
+        }
+
+        let now = now_ms();
+        if now.saturating_sub(last_past_outcomes_refresh_ms) >= past_outcomes_refresh_ms {
+            let past_outcomes_payload = match polymarket_ws::fetch_market_outcome_payload_from_env().await {
+                Ok(official_payload) => official_payload,
+                Err(err) => derive_past_outcomes_payload_from_history(&trade_history, Some(err.to_string())),
+            };
+
+            if let Err(err) = publish_past_outcomes_to_redis(
+                &redis_url,
+                &redis_past_outcomes_key,
+                &past_outcomes_payload,
+                &mut redis_conn,
+            )
+            .await
+            {
+                eprintln!("redis past-outcomes publish error: {err:#}");
+            } else {
+                last_past_outcomes_refresh_ms = now;
+            }
         }
     }
 }
@@ -1535,6 +1589,7 @@ async fn publish_portfolio_daily_to_redis(
 async fn publish_aux_stream_payloads_to_redis(
     redis_url: &str,
     live_btc_key: &str,
+    chainlink_quote: Option<Quote>,
     bn_quote: Option<Quote>,
     conn: &mut Option<MultiplexedConnection>,
 ) -> Result<()> {
@@ -1547,7 +1602,14 @@ async fn publish_aux_stream_payloads_to_redis(
         *conn = Some(c);
     }
 
-    let live_btc_payload = if let Some(q) = bn_quote {
+    let live_btc_payload = if let Some(q) = chainlink_quote {
+        json!({
+            "source": q.venue,
+            "symbol": q.symbol,
+            "price": q.price,
+            "ts_ms": q.ts_ms
+        })
+    } else if let Some(q) = bn_quote {
         json!({
             "source": q.venue,
             "symbol": q.symbol,
@@ -1569,6 +1631,90 @@ async fn publish_aux_stream_payloads_to_redis(
     }
 
     Ok(())
+}
+
+async fn publish_past_outcomes_to_redis(
+    redis_url: &str,
+    key: &str,
+    payload: &serde_json::Value,
+    conn: &mut Option<MultiplexedConnection>,
+) -> Result<()> {
+    if conn.is_none() {
+        let client = redis::Client::open(redis_url).context("invalid redis url")?;
+        let c = client
+            .get_multiplexed_async_connection()
+            .await
+            .context("connect to redis")?;
+        *conn = Some(c);
+    }
+
+    if let Some(c) = conn.as_mut() {
+        let encoded = serde_json::to_string(payload).context("serialize past outcomes payload")?;
+        let set_res: redis::RedisResult<()> = c.set(key, encoded).await;
+        if let Err(e) = set_res {
+            *conn = None;
+            return Err(anyhow!("redis set past outcomes failed: {e}"));
+        }
+    }
+
+    Ok(())
+}
+
+fn derive_past_outcomes_payload_from_history(
+    trade_history: &[CompletedTrade],
+    warning: Option<String>,
+) -> serde_json::Value {
+    let mut sample_size = 0usize;
+    let mut up_trades = 0usize;
+    let mut down_trades = 0usize;
+    let mut sum_probability_up = 0.0_f64;
+
+    for trade in trade_history {
+        let mut p_up = trade.exit_probability;
+        if !p_up.is_finite() {
+            continue;
+        }
+        p_up = p_up.clamp(0.0, 1.0);
+
+        let direction = trade.direction.trim().to_ascii_lowercase();
+        if direction == "up" {
+            up_trades += 1;
+        } else if direction == "down" {
+            down_trades += 1;
+            p_up = (1.0 - p_up).clamp(0.0, 1.0);
+        } else {
+            continue;
+        }
+
+        sum_probability_up += p_up;
+        sample_size += 1;
+    }
+
+    let probability_up = if sample_size > 0 {
+        sum_probability_up / sample_size as f64
+    } else {
+        0.5
+    };
+    let probability_down = (1.0 - probability_up).clamp(0.0, 1.0);
+
+    let mut payload = json!({
+        "probability_up": probability_up,
+        "probability_down": probability_down,
+        "sample_size": sample_size,
+        "up_trades": up_trades,
+        "down_trades": down_trades,
+        "source": "derived_from_completed_trades",
+        "ts_ms": now_ms(),
+    });
+
+    if let Some(w) = warning {
+        let trimmed = w.trim();
+        if !trimmed.is_empty() {
+            payload["warning"] = json!(trimmed);
+        }
+    }
+
+    payload
 }
 fn waiting_state(day_pnl_usd: f64, open_positions: usize) -> TraderState {
     TraderState {

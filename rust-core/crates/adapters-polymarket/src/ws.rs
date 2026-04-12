@@ -282,16 +282,7 @@ async fn resolve_market_id_from_event_slug(
     event_slug: &str,
     preferred_market_slug: Option<&str>,
 ) -> Result<String> {
-    match resolve_market_id_from_gamma_event(event_slug, preferred_market_slug).await {
-        Ok(id) => Ok(id),
-        Err(gamma_err) => resolve_market_id_from_activity_ws(event_slug)
-            .await
-            .with_context(|| {
-                format!(
-                    "gamma lookup failed ({gamma_err:#}); activity websocket fallback failed for event_slug={event_slug}"
-                )
-            }),
-    }
+    resolve_market_id_from_gamma_event(event_slug, preferred_market_slug).await
 }
 
 async fn resolve_market_id_from_gamma_event(event_slug: &str, preferred_market_slug: Option<&str>) -> Result<String> {
@@ -634,103 +625,80 @@ async fn resolve_market_metadata_by_event_slug(
     let market = pick.context("no market found for event slug")?;
     Ok(parse_market_metadata_from_value(market))
 }
-async fn resolve_market_id_from_activity_ws(event_slug: &str) -> Result<String> {
-    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
-    let (mut ws, _) = connect_async(url.as_str())
+
+pub async fn fetch_market_outcome_payload_from_env() -> Result<Value> {
+    let resolved = resolve_instrument_from_env().await?;
+    let market_id = if resolved.instrument_id.starts_with("0x") {
+        resolved.instrument_id
+    } else {
+        let event_slug = event_slug_for_subscription();
+        resolve_market_id_from_event_slug(&event_slug, None)
+            .await
+            .with_context(|| format!("failed to resolve market id from event slug {event_slug}"))?
+    };
+
+    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/markets/{market_id}");
+
+    let market: Value = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
         .await
-        .context("failed to connect to polymarket live-data websocket")?;
-
-    let filters = serde_json::to_string(&json!({ "event_slug": event_slug }))
-        .context("failed to encode activity filters")?;
-    let subscribe = json!({
-        "action": "subscribe",
-        "subscriptions": [
-            {
-                "topic": "activity",
-                "type": "orders_matched",
-                "filters": filters
-            }
-        ]
-    });
-
-    ws.send(Message::Text(subscribe.to_string().into()))
+        .with_context(|| format!("gamma market request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma market request non-success: {url}"))?
+        .json()
         .await
-        .context("failed to subscribe activity websocket")?;
+        .with_context(|| format!("gamma market decode failed: {url}"))?;
 
-    let deadline = Duration::from_secs(25);
-    let start = std::time::Instant::now();
+    let outcomes = parse_market_outcome_labels(&market);
+    let prices = parse_market_outcome_prices(&market);
+    let (probability_up, probability_down) = assign_up_down_probabilities(&outcomes, &prices);
+    let up_prob = probability_up.unwrap_or(0.5);
+    let down_prob = probability_down.unwrap_or((1.0 - up_prob).clamp(0.0, 1.0));
 
-    loop {
-        if start.elapsed() > deadline {
-            bail!("timed out waiting for activity stream conditionId");
-        }
+    let mut winning_outcome = market
+        .get("winning_outcome")
+        .or_else(|| market.get("winningOutcome"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
-        let Some(msg) = (match next {
-            Ok(v) => v,
-            Err(_) => {
-                ws.send(Message::Ping(Vec::new().into()))
-                    .await
-                    .context("failed to send activity keepalive ping")?;
-                continue;
-            }
-        }) else {
-            bail!("activity websocket ended before market id could be resolved");
-        };
-
-        let msg = msg.context("activity websocket read error")?;
-        match msg {
-            Message::Text(text) => {
-                let Some(payload) = parse_ws_json_text(&text) else {
-                    continue;
-                };
-                if let Some(mid) = parse_condition_id_from_activity_message(&payload, event_slug) {
-                    return Ok(mid);
-                }
-            }
-            Message::Ping(payload) => {
-                ws.send(Message::Pong(payload))
-                    .await
-                    .context("failed to pong activity websocket")?;
-            }
-            Message::Close(_) => bail!("activity websocket closed"),
-            _ => {}
+    if winning_outcome.is_none() {
+        if up_prob >= 0.999 {
+            winning_outcome = Some("Yes".to_string());
+        } else if down_prob >= 0.999 {
+            winning_outcome = Some("No".to_string());
         }
     }
-}
 
-fn parse_condition_id_from_activity_message(payload: &Value, event_slug: &str) -> Option<String> {
-    let topic = payload.get("topic").and_then(Value::as_str)?;
-    if topic != "activity" {
-        return None;
-    }
+    let asset_ids = parse_market_asset_ids_from_gamma_market(&market);
+    let winning_asset_id = match winning_outcome.as_ref().map(|s| s.to_ascii_lowercase()) {
+        Some(ref w) if w == "yes" || w == "up" => asset_ids.first().cloned(),
+        Some(ref w) if w == "no" || w == "down" => asset_ids.get(1).cloned(),
+        _ => None,
+    };
 
-    let msg_type = payload.get("type").and_then(Value::as_str)?;
-    if msg_type != "orders_matched" {
-        return None;
-    }
+    let closed = market.get("closed").and_then(Value::as_bool);
+    let resolved_flag = market
+        .get("resolved")
+        .and_then(Value::as_bool)
+        .or_else(|| Some(winning_outcome.is_some() || up_prob >= 0.999 || down_prob >= 0.999));
 
-    let item = payload.get("payload")?;
-    let msg_event_slug = item
-        .get("eventSlug")
-        .and_then(Value::as_str)
-        .or_else(|| item.get("event_slug").and_then(Value::as_str));
-
-    if msg_event_slug != Some(event_slug) {
-        return None;
-    }
-
-    let candidate = item
-        .get("conditionId")
-        .and_then(Value::as_str)
-        .or_else(|| item.get("condition_id").and_then(Value::as_str))?;
-
-    let trimmed = candidate.trim();
-    if trimmed.starts_with("0x") && !trimmed.is_empty() {
-        return Some(trimmed.to_string());
-    }
-
-    None
+    Ok(json!({
+        "market_id": market_id,
+        "resolved": resolved_flag,
+        "closed": closed,
+        "winning_outcome": winning_outcome,
+        "winning_asset_id": winning_asset_id,
+        "probability_up": up_prob,
+        "probability_down": down_prob,
+        "source": "official_gamma_api_markets",
+        "ts_ms": now_ms(),
+    }))
 }
 
 fn auto_today_event_slug() -> String {
@@ -1206,107 +1174,9 @@ async fn resolve_market_asset_ids(market_id: &str) -> Result<Vec<String>> {
     }
 
 
-    if let Ok(ids) = resolve_market_asset_ids_from_activity_ws(market_id).await {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
-    }
     bail!("could not resolve market asset ids for market_id={market_id}");
 }
 
-
-async fn resolve_market_asset_ids_from_activity_ws(condition_id: &str) -> Result<Vec<String>> {
-    let url = Url::parse(POLYMARKET_WS_LIVE_DATA).context("invalid polymarket live-data ws url")?;
-    let (mut ws, _) = connect_async(url.as_str())
-        .await
-        .context("failed to connect to polymarket live-data websocket for asset-id fallback")?;
-
-    let subscribe = json!({
-        "action": "subscribe",
-        "subscriptions": [
-            {
-                "topic": "activity",
-                "type": "orders_matched",
-                "filters": "{}"
-            }
-        ]
-    });
-
-    ws.send(Message::Text(subscribe.to_string().into()))
-        .await
-        .context("failed to subscribe live-data activity stream for asset-id fallback")?;
-
-    let deadline = Duration::from_secs(25);
-    let start = std::time::Instant::now();
-    let mut ids: Vec<String> = Vec::new();
-
-    while start.elapsed() <= deadline {
-        let next = timeout(Duration::from_secs(WS_HEARTBEAT_SECONDS), ws.next()).await;
-        let Some(msg) = (match next {
-            Ok(v) => v,
-            Err(_) => {
-                ws.send(Message::Ping(Vec::new().into()))
-                    .await
-                    .context("failed to ping live-data activity stream")?;
-                continue;
-            }
-        }) else {
-            break;
-        };
-
-        let msg = msg.context("live-data activity stream read error")?;
-        match msg {
-            Message::Text(text) => {
-                let Some(payload) = parse_ws_json_text(&text) else {
-                    continue;
-                };
-                let topic = payload.get("topic").and_then(Value::as_str);
-                let ty = payload.get("type").and_then(Value::as_str);
-                if topic != Some("activity") || ty != Some("orders_matched") {
-                    continue;
-                }
-
-                let item = match payload.get("payload") {
-                    Some(v) => v,
-                    None => continue,
-                };
-                let cid = item
-                    .get("conditionId")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("condition_id").and_then(Value::as_str));
-                if cid != Some(condition_id) {
-                    continue;
-                }
-
-                if let Some(asset) = item
-                    .get("asset")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("asset_id").and_then(Value::as_str))
-                {
-                    let asset = asset.trim();
-                    if !asset.is_empty() && !ids.iter().any(|v| v == asset) {
-                        ids.push(asset.to_string());
-                        if ids.len() >= 2 {
-                            break;
-                        }
-                    }
-                }
-            }
-            Message::Ping(payload) => {
-                ws.send(Message::Pong(payload))
-                    .await
-                    .context("failed to pong live-data activity stream")?;
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    if ids.is_empty() {
-        bail!("no matching activity assets found for condition_id={condition_id}");
-    }
-    Ok(ids)
-}
 
 async fn fetch_market_asset_ids_from_gamma(client: &reqwest::Client, url: &str) -> Result<Vec<String>> {
     let resp = client
@@ -1467,6 +1337,58 @@ fn parse_market_outcome_labels(v: &Value) -> Vec<String> {
     }
 
     Vec::new()
+}
+
+fn parse_market_outcome_prices(v: &Value) -> Vec<f64> {
+    if let Some(arr) = v.get("outcomePrices").and_then(Value::as_array) {
+        return arr
+            .iter()
+            .filter_map(parse_price)
+            .filter(|p| p.is_finite())
+            .collect();
+    }
+
+    if let Some(s) = v.get("outcomePrices").and_then(Value::as_str) {
+        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
+            return arr
+                .iter()
+                .filter_map(parse_price)
+                .filter(|p| p.is_finite())
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+fn assign_up_down_probabilities(outcomes: &[String], prices: &[f64]) -> (Option<f64>, Option<f64>) {
+    if prices.is_empty() {
+        return (None, None);
+    }
+
+    let mut up: Option<f64> = None;
+    let mut down: Option<f64> = None;
+
+    for (idx, label) in outcomes.iter().enumerate() {
+        let p = match prices.get(idx) {
+            Some(v) => *v,
+            None => continue,
+        };
+        if label.eq_ignore_ascii_case("yes") || label.eq_ignore_ascii_case("up") {
+            up = Some(p);
+        } else if label.eq_ignore_ascii_case("no") || label.eq_ignore_ascii_case("down") {
+            down = Some(p);
+        }
+    }
+
+    if up.is_none() {
+        up = prices.first().copied();
+    }
+    if down.is_none() {
+        down = prices.get(1).copied().or_else(|| up.map(|v| (1.0 - v).clamp(0.0, 1.0)));
+    }
+
+    (up, down)
 }
 
 async fn resolve_outcome_token_map(

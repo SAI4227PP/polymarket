@@ -298,7 +298,7 @@ func main() {
 
             var pastOutcomesPayload interface{}
             if err := readCachedJSONWithTimeout(r.Context(), cache, pastOutcomesKey, &pastOutcomesPayload, 1200*time.Millisecond); err != nil {
-                pastOutcomesPayload = map[string]interface{}{"warning": err.Error()}
+                pastOutcomesPayload = derivePastOutcomesFromCompletedTrades(finalTrades, err.Error())
             }
 
             if snapErr != nil {
@@ -811,6 +811,49 @@ func readCachedJSONWithTimeout(
 		return errors.New("redis read timeout")
 	}
 	return err
+}
+
+func derivePastOutcomesFromCompletedTrades(trades []completedTrade, warning string) map[string]interface{} {
+	probabilityUp := 0.5
+	sampleSize := 0
+	upCount := 0
+	downCount := 0
+	sumUpProbability := 0.0
+
+	for _, t := range trades {
+		p := t.ExitProbability
+		if p < 0 || p > 1 {
+			continue
+		}
+		direction := strings.ToLower(strings.TrimSpace(t.Direction))
+		switch direction {
+		case "up":
+			upCount++
+		case "down":
+			downCount++
+			p = 1 - p
+		default:
+			continue
+		}
+		sumUpProbability += p
+		sampleSize++
+	}
+
+	if sampleSize > 0 {
+		probabilityUp = sumUpProbability / float64(sampleSize)
+	}
+
+	result := map[string]interface{}{
+		"probability_up": probabilityUp,
+		"sample_size":    sampleSize,
+		"up_trades":      upCount,
+		"down_trades":    downCount,
+		"source":         "derived_from_completed_trades",
+	}
+	if strings.TrimSpace(warning) != "" {
+		result["warning"] = warning
+	}
+	return result
 }
 
 func getenv(key, fallback string) string {
