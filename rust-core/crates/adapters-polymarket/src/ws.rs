@@ -286,48 +286,8 @@ async fn resolve_market_id_from_event_slug(
 }
 
 async fn resolve_market_id_from_gamma_event(event_slug: &str, preferred_market_slug: Option<&str>) -> Result<String> {
-    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
-        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
-    let base = base.trim_end_matches('/');
-    let url = format!("{base}/events/slug/{event_slug}");
-
-    let payload: Value = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .with_context(|| format!("gamma event request failed: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("gamma event request non-success: {url}"))?
-        .json()
-        .await
-        .with_context(|| format!("gamma event decode failed: {url}"))?;
-
-    let markets = payload
-        .get("markets")
-        .and_then(Value::as_array)
-        .context("gamma event payload missing markets")?;
-
-    let pick = if let Some(mslug) = preferred_market_slug {
-        markets.iter().find(|m| m.get("slug").and_then(Value::as_str) == Some(mslug))
-    } else {
-        markets
-            .iter()
-            .filter_map(|m| {
-                let active = m.get("active").and_then(Value::as_bool).unwrap_or(false);
-                let closed = m.get("closed").and_then(Value::as_bool).unwrap_or(false);
-                let vol = m.get("volumeNum").and_then(Value::as_f64).or_else(|| {
-                    m.get("volume")
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<f64>().ok())
-                }).unwrap_or(0.0);
-                Some((m, if active { 2 } else { 0 } + if !closed { 1 } else { 0 }, vol))
-            })
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)))
-            .map(|(m,_,_)| m)
-    };
-
-    let market = pick.context("no market found for event slug")?;
+    let payload = fetch_gamma_event_payload_by_slug(event_slug).await?;
+    let market = select_market_from_event_payload(&payload, preferred_market_slug, None)?;
 
     if let Some(cid) = market.get("conditionId").and_then(Value::as_str) {
         let cid = cid.trim();
@@ -344,6 +304,77 @@ async fn resolve_market_id_from_gamma_event(event_slug: &str, preferred_market_s
     }
 
     bail!("resolved market is missing a usable 0x market identifier");
+}
+
+fn gamma_api_base() -> String {
+    std::env::var("POLYMARKET_GAMMA_API_URL")
+        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+async fn fetch_gamma_event_payload_by_slug(event_slug: &str) -> Result<Value> {
+    let base = gamma_api_base();
+    let url = format!("{base}/events/slug/{event_slug}");
+
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma event request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma event request non-success: {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("gamma event decode failed: {url}"))
+}
+
+fn select_market_from_event_payload<'a>(
+    payload: &'a Value,
+    preferred_market_slug: Option<&str>,
+    preferred_market_id: Option<&str>,
+) -> Result<&'a Value> {
+    let markets = payload
+        .get("markets")
+        .and_then(Value::as_array)
+        .context("gamma event payload missing markets")?;
+
+    let pick = if let Some(market_id) = preferred_market_id {
+        markets
+            .iter()
+            .find(|m| {
+                m.get("conditionId").and_then(Value::as_str) == Some(market_id)
+                    || m.get("id").and_then(Value::as_str) == Some(market_id)
+            })
+            .or_else(|| if markets.len() == 1 { markets.first() } else { None })
+    } else if let Some(mslug) = preferred_market_slug {
+        markets.iter().find(|m| m.get("slug").and_then(Value::as_str) == Some(mslug))
+    } else {
+        markets
+            .iter()
+            .filter_map(|m| {
+                let active = m.get("active").and_then(Value::as_bool).unwrap_or(false);
+                let closed = m.get("closed").and_then(Value::as_bool).unwrap_or(false);
+                let vol = m
+                    .get("volumeNum")
+                    .and_then(Value::as_f64)
+                    .or_else(|| {
+                        m.get("volume")
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<f64>().ok())
+                    })
+                    .unwrap_or(0.0);
+                Some((m, if active { 2 } else { 0 } + if !closed { 1 } else { 0 }, vol))
+            })
+            .max_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            })
+            .map(|(m, _, _)| m)
+    };
+
+    pick.context("no market found in gamma event payload")
 }
 
 
@@ -612,73 +643,33 @@ async fn resolve_market_metadata_by_event_slug(
     event_slug: &str,
     preferred_market_slug: Option<&str>,
 ) -> Result<ResolvedMarketMetadata> {
-    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
-        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
-    let base = base.trim_end_matches('/');
-    let url = format!("{base}/events/slug/{event_slug}");
-
-    let payload: Value = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .with_context(|| format!("gamma event request failed: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("gamma event request non-success: {url}"))?
-        .json()
-        .await
-        .with_context(|| format!("gamma event decode failed: {url}"))?;
-
-    let markets = payload
-        .get("markets")
-        .and_then(Value::as_array)
-        .context("gamma event payload missing markets")?;
-
-    let pick = if let Some(mslug) = preferred_market_slug {
-        markets.iter().find(|m| m.get("slug").and_then(Value::as_str) == Some(mslug))
-    } else {
-        markets
-            .iter()
-            .filter_map(|m| {
-                let active = m.get("active").and_then(Value::as_bool).unwrap_or(false);
-                let closed = m.get("closed").and_then(Value::as_bool).unwrap_or(false);
-                let vol = m
-                    .get("volumeNum")
-                    .and_then(Value::as_f64)
-                    .or_else(|| {
-                        m.get("volume")
-                            .and_then(Value::as_str)
-                            .and_then(|s| s.parse::<f64>().ok())
-                    })
-                    .unwrap_or(0.0);
-                Some((m, if active { 2 } else { 0 } + if !closed { 1 } else { 0 }, vol))
-            })
-            .max_by(|a, b| {
-                a.1.cmp(&b.1)
-                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-            })
-            .map(|(m, _, _)| m)
-    };
-
-    let market = pick.context("no market found for event slug")?;
+    let payload = fetch_gamma_event_payload_by_slug(event_slug).await?;
+    let market = select_market_from_event_payload(&payload, preferred_market_slug, None)?;
     Ok(parse_market_metadata_from_value(market))
 }
 
 pub async fn fetch_market_outcome_payload_from_env() -> Result<Value> {
     let resolved = resolve_instrument_from_env().await?;
-    let market_id = if resolved.instrument_id.starts_with("0x") {
-        resolved.instrument_id
-    } else {
-        let event_slug = event_slug_for_subscription();
-        resolve_market_id_from_event_slug(&event_slug, None)
-            .await
-            .with_context(|| format!("failed to resolve market id from event slug {event_slug}"))?
-    };
+    let event_slug = event_slug_for_subscription();
+    let payload = fetch_gamma_event_payload_by_slug(&event_slug).await?;
 
-    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
-        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
-    let base = base.trim_end_matches('/');
-    let market = fetch_gamma_market_payload(&base, &market_id).await?;
+    let preferred_market_id = if resolved.instrument_id.starts_with("0x") {
+        Some(resolved.instrument_id.as_str())
+    } else {
+        None
+    };
+    let preferred_market_slug = if preferred_market_id.is_none() {
+        Some(event_slug.as_str())
+    } else {
+        None
+    };
+    let market = select_market_from_event_payload(&payload, preferred_market_slug, preferred_market_id)?;
+    let market_id = market
+        .get("conditionId")
+        .and_then(Value::as_str)
+        .or_else(|| market.get("id").and_then(Value::as_str))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| resolved.instrument_id.clone());
 
     let outcomes = parse_market_outcome_labels(&market);
     let prices = parse_market_outcome_prices(&market);
@@ -725,49 +716,6 @@ pub async fn fetch_market_outcome_payload_from_env() -> Result<Value> {
         "source": "official_gamma_api_markets",
         "ts_ms": now_ms(),
     }))
-}
-
-async fn fetch_gamma_market_payload(base: &str, market_id: &str) -> Result<Value> {
-    let client = reqwest::Client::new();
-    let mut errors = Vec::new();
-    let urls = [
-        format!("{base}/markets/{market_id}"),
-        format!("{base}/markets?id={market_id}"),
-        format!("{base}/markets?condition_id={market_id}"),
-        format!("{base}/markets?conditionId={market_id}"),
-    ];
-
-    for url in urls {
-        match fetch_one_gamma_market_payload(&client, &url).await {
-            Ok(v) => return Ok(v),
-            Err(err) => errors.push(format!("{url}: {err:#}")),
-        }
-    }
-
-    bail!("gamma market lookup failed for {market_id}: {}", errors.join(" | "));
-}
-
-async fn fetch_one_gamma_market_payload(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let payload: Value = client
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .with_context(|| format!("gamma market request failed: {url}"))?
-        .error_for_status()
-        .with_context(|| format!("gamma market request non-success: {url}"))?
-        .json()
-        .await
-        .with_context(|| format!("gamma market decode failed: {url}"))?;
-
-    match payload {
-        Value::Object(_) => Ok(payload),
-        Value::Array(items) => items
-            .into_iter()
-            .find(|item| item.is_object())
-            .context("gamma market payload array missing object market"),
-        _ => bail!("gamma market payload is neither object nor array"),
-    }
 }
 
 fn auto_today_event_slug() -> String {
@@ -1201,6 +1149,10 @@ async fn run_market_quote_stream_from_endpoint(
 }
 
 fn parse_market_asset_ids_from_env() -> Vec<String> {
+    if should_ignore_env_asset_ids_for_auto_epoch_mode() {
+        return Vec::new();
+    }
+
     let raw = match std::env::var("POLYMARKET_OUTCOME_ASSET_IDS") {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -1216,70 +1168,52 @@ fn parse_market_asset_ids_from_env() -> Vec<String> {
     out
 }
 
+fn should_ignore_env_asset_ids_for_auto_epoch_mode() -> bool {
+    let force_static = first_non_empty_env("POLYMARKET_FORCE_STATIC_OUTCOME_ASSET_IDS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if force_static {
+        return false;
+    }
+
+    let mode = first_non_empty_env("POLYMARKET_AUTO_EVENT_MODE").unwrap_or_default();
+    if !mode.eq_ignore_ascii_case("epoch_5m") {
+        return false;
+    }
+
+    // If user explicitly pins any target market/instrument, keep honoring static ids.
+    if first_non_empty_env("POLYMARKET_ASSET_ID").is_some()
+        || first_non_empty_env("POLYMARKET_MARKET_ID").is_some()
+        || first_non_empty_env("POLYMARKET_EVENT_SLUG").is_some()
+        || first_non_empty_env("POLYMARKET_EVENT_URL").is_some()
+    {
+        return false;
+    }
+
+    true
+}
+
 async fn resolve_market_asset_ids(market_id: &str) -> Result<Vec<String>> {
     let env_ids = parse_market_asset_ids_from_env();
     if !env_ids.is_empty() {
         return Ok(env_ids);
     }
 
-    let base = std::env::var("POLYMARKET_GAMMA_API_URL")
-        .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string());
-    let base = base.trim_end_matches('/');
-    let client = reqwest::Client::new();
-
-    let by_path = format!("{base}/markets/{market_id}");
-    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_path).await {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
+    let event_slug = event_slug_for_subscription();
+    if event_slug.trim().is_empty() {
+        bail!("event slug is empty; cannot resolve market asset ids");
     }
 
-    let by_query = format!("{base}/markets?id={market_id}");
-    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_query).await {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
-    }
-
-    let by_condition_snake = format!("{base}/markets?condition_id={market_id}");
-    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_condition_snake).await {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
-    }
-
-    let by_condition_camel = format!("{base}/markets?conditionId={market_id}");
-    if let Ok(ids) = fetch_market_asset_ids_from_gamma(&client, &by_condition_camel).await {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
-    }
-
-
-    bail!("could not resolve market asset ids for market_id={market_id}");
+    resolve_market_asset_ids_from_event_slug(&event_slug, market_id).await
 }
 
+async fn resolve_market_asset_ids_from_event_slug(event_slug: &str, market_id: &str) -> Result<Vec<String>> {
+    let payload = fetch_gamma_event_payload_by_slug(event_slug).await?;
+    let selected = select_market_from_event_payload(&payload, None, Some(market_id))?;
 
-async fn fetch_market_asset_ids_from_gamma(client: &reqwest::Client, url: &str) -> Result<Vec<String>> {
-    let resp = client
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .with_context(|| format!("gamma request failed: {url}"))?;
-
-    if !resp.status().is_success() {
-        bail!("gamma request non-success status {} for {}", resp.status(), url);
-    }
-
-    let payload: Value = resp
-        .json()
-        .await
-        .with_context(|| format!("gamma response json decode failed: {url}"))?;
-
-    let ids = parse_market_asset_ids_from_gamma_payload(&payload);
+    let ids = parse_market_asset_ids_from_gamma_market(selected);
     if ids.is_empty() {
-        bail!("gamma response had no market asset ids");
+        bail!("matched market in event payload had no clobTokenIds");
     }
     Ok(ids)
 }
@@ -1307,20 +1241,6 @@ async fn fetch_market_outcome_token_map_from_gamma(
     parse_market_outcome_token_map_from_gamma_payload(&payload)
         .context("gamma response had no outcome token map")
 }
-fn parse_market_asset_ids_from_gamma_payload(payload: &Value) -> Vec<String> {
-    match payload {
-        Value::Object(_) => parse_market_asset_ids_from_gamma_market(payload),
-        Value::Array(items) => items
-            .iter()
-            .find_map(|v| {
-                let ids = parse_market_asset_ids_from_gamma_market(v);
-                if ids.is_empty() { None } else { Some(ids) }
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
 fn parse_market_asset_ids_from_gamma_market(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(arr) = v.get("clobTokenIds").and_then(Value::as_array) {
