@@ -12,6 +12,7 @@ use url::Url;
 const POLYMARKET_WS_MARKET_CLOB: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const POLYMARKET_WS_LIVE_DATA: &str = "wss://ws-live-data.polymarket.com/";
 const WS_HEARTBEAT_SECONDS: u64 = 10;
+const MARKET_WS_FIRST_QUOTE_TIMEOUT_MS_DEFAULT: u64 = 20_000;
 
 #[derive(Debug, Clone)]
 enum InstrumentMode {
@@ -108,6 +109,14 @@ fn ws_debug_enabled() -> bool {
     first_non_empty_env("POLYMARKET_WS_DEBUG")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn market_ws_first_quote_timeout() -> Duration {
+    let timeout_ms = first_non_empty_env("POLYMARKET_MARKET_WS_FIRST_QUOTE_TIMEOUT_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(MARKET_WS_FIRST_QUOTE_TIMEOUT_MS_DEFAULT)
+        .max(1_000);
+    Duration::from_millis(timeout_ms)
 }
 
 fn parse_ws_json_text(text: &str) -> Option<Value> {
@@ -923,8 +932,13 @@ async fn stream_market_quote_from_endpoint(instrument_id: &str, endpoint: &str) 
     let preferred_asset: Option<String> = None;
     let heartbeat_interval = Duration::from_secs(WS_HEARTBEAT_SECONDS);
     let mut next_heartbeat_at = Instant::now() + heartbeat_interval;
+    let first_quote_deadline = Instant::now() + market_ws_first_quote_timeout();
 
     loop {
+        if Instant::now() >= first_quote_deadline {
+            bail!("polymarket market websocket connected but yielded no quote before timeout");
+        }
+
         if Instant::now() >= next_heartbeat_at {
             tracker.record(
                 MarketWsTrackedMessageKind::Ping,
@@ -1043,8 +1057,14 @@ async fn run_market_quote_stream_from_endpoint(
     let mut preferred_asset: Option<String> = None;
     let heartbeat_interval = Duration::from_secs(WS_HEARTBEAT_SECONDS);
     let mut next_heartbeat_at = Instant::now() + heartbeat_interval;
+    let first_quote_deadline = Instant::now() + market_ws_first_quote_timeout();
+    let mut has_seen_quote = false;
 
     loop {
+        if !has_seen_quote && Instant::now() >= first_quote_deadline {
+            bail!("polymarket market websocket connected but yielded no quote before timeout");
+        }
+
         if Instant::now() >= next_heartbeat_at {
             tracker.record(
                 MarketWsTrackedMessageKind::Ping,
@@ -1116,6 +1136,7 @@ async fn run_market_quote_stream_from_endpoint(
                     if preferred_asset.is_none() {
                         preferred_asset = Some(quote.symbol.clone());
                     }
+                    has_seen_quote = true;
                     let _ = tx.send(Some(quote));
                 }
             }
@@ -1199,6 +1220,12 @@ async fn resolve_market_asset_ids(market_id: &str) -> Result<Vec<String>> {
         return Ok(env_ids);
     }
 
+    if let Ok(ids) = resolve_market_asset_ids_by_condition_id(market_id).await {
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
     let event_slug = event_slug_for_subscription();
     if event_slug.trim().is_empty() {
         bail!("event slug is empty; cannot resolve market asset ids");
@@ -1216,6 +1243,90 @@ async fn resolve_market_asset_ids_from_event_slug(event_slug: &str, market_id: &
         bail!("matched market in event payload had no clobTokenIds");
     }
     Ok(ids)
+}
+
+async fn resolve_market_asset_ids_by_condition_id(market_id: &str) -> Result<Vec<String>> {
+    let trimmed_market_id = market_id.trim();
+    if trimmed_market_id.is_empty() {
+        bail!("market id is empty");
+    }
+
+    let base = gamma_api_base();
+    let direct_url = format!("{base}/markets/{trimmed_market_id}");
+    let direct_payload = reqwest::Client::new()
+        .get(&direct_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma market-by-id request failed: {direct_url}"))
+        .and_then(|resp| {
+            resp.error_for_status()
+                .with_context(|| format!("gamma market-by-id request non-success: {direct_url}"))
+        })
+        .and_then(|resp| async {
+            resp.json::<Value>()
+                .await
+                .with_context(|| format!("gamma market-by-id decode failed: {direct_url}"))
+        }
+        .await);
+    if let Ok(payload) = direct_payload {
+        let ids = parse_market_asset_ids_from_gamma_market(&payload);
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+
+    let url = format!("{base}/markets");
+    let payload: Value = reqwest::Client::new()
+        .get(&url)
+        .query(&[
+            ("condition_ids", trimmed_market_id),
+            ("limit", "10"),
+            ("closed", "true"),
+        ])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("gamma markets request failed: {url}"))?
+        .error_for_status()
+        .with_context(|| format!("gamma markets request non-success: {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("gamma markets decode failed: {url}"))?;
+
+    let market = select_market_from_markets_payload(&payload, trimmed_market_id)
+        .context("no gamma market matched provided condition id")?;
+    let ids = parse_market_asset_ids_from_gamma_market(market);
+    if ids.is_empty() {
+        bail!("gamma market matched condition id but has no clobTokenIds");
+    }
+    Ok(ids)
+}
+
+fn select_market_from_markets_payload<'a>(payload: &'a Value, market_id: &str) -> Option<&'a Value> {
+    let market_matches = |market: &'a Value| {
+        let condition_id = market
+            .get("conditionId")
+            .or_else(|| market.get("condition_id"))
+            .and_then(Value::as_str);
+        let id = market.get("id").and_then(Value::as_str);
+        condition_id == Some(market_id) || id == Some(market_id)
+    };
+
+    match payload {
+        Value::Array(items) => items.iter().find(|m| market_matches(m)),
+        Value::Object(map) => {
+            if (map.contains_key("conditionId") || map.contains_key("condition_id") || map.contains_key("id"))
+                && market_matches(payload)
+            {
+                return Some(payload);
+            }
+            map.get("data")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().find(|m| market_matches(m)))
+        }
+        _ => None,
+    }
 }
 
 async fn fetch_market_outcome_token_map_from_gamma(
@@ -1243,7 +1354,11 @@ async fn fetch_market_outcome_token_map_from_gamma(
 }
 fn parse_market_asset_ids_from_gamma_market(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(arr) = v.get("clobTokenIds").and_then(Value::as_array) {
+    if let Some(arr) = v
+        .get("clobTokenIds")
+        .or_else(|| v.get("clob_token_ids"))
+        .and_then(Value::as_array)
+    {
         for idv in arr {
             if let Some(id) = idv.as_str() {
                 let id = id.trim();
@@ -1255,7 +1370,11 @@ fn parse_market_asset_ids_from_gamma_market(v: &Value) -> Vec<String> {
         return out;
     }
 
-    if let Some(s) = v.get("clobTokenIds").and_then(Value::as_str) {
+    if let Some(s) = v
+        .get("clobTokenIds")
+        .or_else(|| v.get("clob_token_ids"))
+        .and_then(Value::as_str)
+    {
         if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
             for idv in arr {
                 if let Some(id) = idv.as_str() {

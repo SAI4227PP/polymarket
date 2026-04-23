@@ -1873,10 +1873,19 @@ fn spawn_polymarket_stream(tx: watch::Sender<Option<Quote>>) {
                     active_source = None;
                 }
                 Ok(Err(err)) => {
+                    let err_text = format!("{err:#}");
                     eprintln!(
-                        "polymarket stream error for active instrument={} (will retry same market): {err:#}",
-                        instrument_id
+                        "polymarket stream error for active instrument={} (will retry): {}",
+                        instrument_id, err_text
                     );
+                    if err_text.contains("yielded no quote before timeout") {
+                        eprintln!(
+                            "polymarket stream produced no quote for instrument={}; forcing instrument re-resolve",
+                            instrument_id
+                        );
+                        active_instrument = None;
+                        active_source = None;
+                    }
                 }
                 Err(err) => {
                     eprintln!(
